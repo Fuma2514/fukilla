@@ -171,7 +171,35 @@ impl Contract {
             funding.as_yoctonear(),
         ));
 
-        promise
+        promise.then(
+            Self::ext(env::current_account_id()).on_wallet_created(task_id.clone(), owner.clone()),
+        )
+    }
+
+    /// Callback: create-promise chain finished. If any step of
+    /// create_account + transfer + deploy + add_key failed, refund the
+    /// funding to the owner and remove the dead registry entry, so a failed
+    /// creation can never strand funds or pollute the task registry.
+    #[private]
+    pub fn on_wallet_created(&mut self, task_id: String, owner: AccountId) {
+        let ok = env::promise_result_checked(0, 0).is_ok();
+        if !ok {
+            // Roll back: forget the task; the sub-account was never usable,
+            // so there is nothing to sweep — refund whatever attached.
+            self.tasks.remove(&task_id);
+            env::log_str(&format!(
+                "{{\"event\":\"wallet_creation_failed\",\"task_id\":\"{}\",\"refund_to\":\"{}\"}}",
+                task_id, owner
+            ));
+            Promise::new(owner)
+                .transfer(env::attached_deposit())
+                .detach();
+        } else {
+            env::log_str(&format!(
+                "{{\"event\":\"wallet_creation_confirmed\",\"task_id\":\"{}\"}}",
+                task_id
+            ));
+        }
     }
 
     /// The ONLY method an agent's key can call. Pays `amount` yoctoNEAR from
@@ -882,7 +910,9 @@ mod fuzz {
         let mut c = Contract::new(accounts(2));
         let _ = c.create_wallet(
             "tiny".to_string(),
-            "ed25519:8h7kFK4t1Pj5wMsmvB5NmMBiF9YZTfbvJdeWPDXCCbT8".parse().unwrap(),
+            "ed25519:8h7kFK4t1Pj5wMsmvB5NmMBiF9YZTfbvJdeWPDXCCbT8"
+                .parse()
+                .unwrap(),
             3600,
             U128::from(1_000_000_000_000_000_000_000_000u128),
             None,
