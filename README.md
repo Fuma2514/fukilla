@@ -124,6 +124,17 @@ Mitigate with unpredictable task IDs and off-chain rate limiting.
 force_expire, the task is marked completed but funds
 may remain in the wallet. No retry path exists currently.
 
+**Gas budget is separate from the payment cap:**
+The agent's function-call key allowance is
+`spend_cap + 0.5 NEAR (GAS_ALLOWANCE_MARGIN)`. Transaction
+gas consumed by the agent is paid from that allowance and
+does NOT increment `spent`. A compromised agent could burn
+gas (e.g. repeated zero-value payments) without ever
+touching the payment cap — total economic loss is bounded
+by `spend_cap + gas budget`, not `spend_cap` alone. If you
+need to cap the entire budget, lower the key allowance or
+treat the margin as an additional risk budget.
+
 ## Mainnet Deployment Checklist
 
 Before deploying to mainnet:

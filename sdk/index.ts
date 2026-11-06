@@ -77,9 +77,11 @@ export class Fukilla {
     const taskId =
       opts.taskId ?? `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
-    // Fund a throwaway owner account via the factory's account as signer.
-    // For production, the caller supplies a funded owner account connection.
-    const account = await near.account(this.cfg.factory);
+    // Sign with the configured owner account (the contract records the CALLER
+    // as task owner). Falls back to the factory account when ownerAccountId
+    // is not set.
+    const ownerAccountId = this.cfg.ownerAccountId ?? this.cfg.factory;
+    const account = await near.account(ownerAccountId);
 
     await account.functionCall({
       contractId: this.cfg.factory,
