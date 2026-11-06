@@ -69,7 +69,7 @@ cargo clippy -- -D warnings
 
 ### Deploy to testnet
 ```bash
-cargo near build && near deploy fukilla.testnet target/wasm32-unknown-unknown/release/ephemeral_wallets.wasm
+cargo near build && near deploy fukilla.testnet target/wasm32-unknown-unknown/release/fukilla.wasm
 ```
 
 ### Run attack simulation
