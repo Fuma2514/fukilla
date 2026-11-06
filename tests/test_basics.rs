@@ -57,6 +57,7 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
     // Verify the task was recorded
     #[derive(near_sdk::serde::Deserialize)]
     #[serde(crate = "near_sdk::serde")]
+    #[allow(dead_code)]
     struct Task {
         owner: AccountId,
         wallet: AccountId,
@@ -88,7 +89,10 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
         )
         .transaction()
         .gas(NearGas::from_tgas(30))
-        .with_signer(wallet_id.clone(), near_api::Signer::from_secret_key(agent_keypair.clone())?)
+        .with_signer(
+            wallet_id.clone(),
+            near_api::Signer::from_secret_key(agent_keypair.clone())?,
+        )
         .send_to(&sandbox_network)
         .await?
         .assert_success();
@@ -119,7 +123,10 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
         )
         .transaction()
         .gas(NearGas::from_tgas(30))
-        .with_signer(wallet_id.clone(), near_api::Signer::from_secret_key(agent_keypair.clone())?)
+        .with_signer(
+            wallet_id.clone(),
+            near_api::Signer::from_secret_key(agent_keypair.clone())?,
+        )
         .send_to(&sandbox_network)
         .await?
         .assert_failure();

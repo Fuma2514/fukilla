@@ -10,9 +10,9 @@
 //   * sweep-back: after the task completes (or expires) anyone can trigger
 //     the wallet's self-destruction, sweeping every remaining yoctoNEAR back
 //     to the owner. No long-lived secret ever needs to exist.
-use near_sdk::store::LookupMap;
-use near_sdk::json_types::U128;
 use near_sdk::Allowance;
+use near_sdk::json_types::U128;
+use near_sdk::store::LookupMap;
 use near_sdk::{AccountId, NearToken, PanicOnDefault, Promise, PublicKey, env, near, require};
 
 #[near(contract_state)]
@@ -62,7 +62,11 @@ const EXECUTOR_WASM: &[u8] = include_bytes!("../executor.wasm");
 impl Contract {
     #[init]
     pub fn new(owner: AccountId) -> Self {
-        Self { owner, tasks: LookupMap::new(b"t"), canary: None }
+        Self {
+            owner,
+            tasks: LookupMap::new(b"t"),
+            canary: None,
+        }
     }
 
     /// Create an ephemeral wallet for a task. The attached deposit funds the
@@ -82,17 +86,26 @@ impl Contract {
         let funding = env::attached_deposit();
         require!(funding > NearToken::from_yoctonear(0), "deposit required");
         // Sub-account creation + FC key + storage needs a minimum; reject tiny wallets.
-        require!(funding.as_yoctonear() >= 50_000_000_000_000_000_000_000, "min 0.05 NEAR funding");
+        require!(
+            funding.as_yoctonear() >= 50_000_000_000_000_000_000_000,
+            "min 0.05 NEAR funding"
+        );
         require!(ttl_sec > 0 && ttl_sec <= 30 * 24 * 3600, "ttl out of range");
         let cap: u128 = spend_cap.into();
         require!(cap > 0, "spend cap must be positive");
         // SENTINEL sanity caps: prevent unbounded velocity bookkeeping (gas
         // griefing) and u64 overflow when converting the window to nanoseconds.
         if let Some(n) = max_calls_per_window {
-            require!(n > 0 && n <= 10_000, "max_calls_per_window must be 1..=10000");
+            require!(
+                n > 0 && n <= 10_000,
+                "max_calls_per_window must be 1..=10000"
+            );
         }
         if let Some(w) = velocity_window_sec {
-            require!(w > 0 && w <= 30 * 24 * 3600, "velocity window must be 1s..=30d");
+            require!(
+                w > 0 && w <= 30 * 24 * 3600,
+                "velocity window must be 1s..=30d"
+            );
         }
         // Validate task_id so the derived sub-account is a valid DIRECT sub-account.
         // A task_id containing dots would parse into a nested account that the
@@ -101,7 +114,9 @@ impl Contract {
         require!(
             !task_id.is_empty()
                 && task_id.len() <= 32
-                && task_id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+                && task_id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
                 && !task_id.starts_with('-')
                 && !task_id.ends_with('-'),
             "task_id must be 1-32 chars: a-z, 0-9, '-', '_'"
@@ -110,10 +125,7 @@ impl Contract {
         let wallet: AccountId = format!("{}.{}", task_id, env::current_account_id())
             .parse()
             .expect("invalid task id");
-        require!(
-            !self.tasks.contains_key(&task_id),
-            "task id already used"
-        );
+        require!(!self.tasks.contains_key(&task_id), "task id already used");
 
         let expiry_ts = env::block_timestamp() + ttl_sec * 1_000_000_000;
         let owner = env::predecessor_account_id();
@@ -171,17 +183,22 @@ impl Contract {
     ) -> Promise {
         let signer = env::signer_account_id();
         let predecessor = env::predecessor_account_id();
-        require!(signer == predecessor, "must be called directly with the agent key");
+        require!(
+            signer == predecessor,
+            "must be called directly with the agent key"
+        );
         // Reject stray deposits: an FC key CAN attach deposits (bounded by allowance)
         // and any attached deposit would be silently stranded in the factory.
-        require!(env::attached_deposit() == NearToken::from_yoctonear(0), "agent_call must not attach a deposit");
+        require!(
+            env::attached_deposit() == NearToken::from_yoctonear(0),
+            "agent_call must not attach a deposit"
+        );
 
-        let task = self
-            .tasks
-            .get(&task_id)
-            .cloned()
-            .expect("unknown task");
-        require!(signer == task.wallet, "this key does not own this task wallet");
+        let task = self.tasks.get(&task_id).cloned().expect("unknown task");
+        require!(
+            signer == task.wallet,
+            "this key does not own this task wallet"
+        );
         require!(!task.completed, "wallet already destroyed");
         // ---- LAYER: quarantine gate ---- a quarantined wallet accepts nothing.
         require!(!task.quarantined, "wallet quarantined: behavior flagged");
@@ -348,7 +365,7 @@ impl Contract {
 mod tests {
     use super::*;
     use near_sdk::test_utils::{VMContextBuilder, accounts};
-    use near_sdk::{testing_env, Gas};
+    use near_sdk::{Gas, testing_env};
 
     const TASK_ID: &str = "research-task-1";
 
@@ -362,7 +379,9 @@ mod tests {
     }
 
     fn pk() -> PublicKey {
-        "ed25519:8h7kFK4t1Pj5wMsmvB5NmMBiF9YZTfbvJdeWPDXCCbT8".parse().unwrap()
+        "ed25519:8h7kFK4t1Pj5wMsmvB5NmMBiF9YZTfbvJdeWPDXCCbT8"
+            .parse()
+            .unwrap()
     }
 
     fn create(contract: &mut Contract) {
@@ -381,7 +400,7 @@ mod tests {
 
     #[test]
     fn create_wallet_records_task() {
-        let mut ctx = context();
+        let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
@@ -394,7 +413,7 @@ mod tests {
 
     #[test]
     fn duplicate_task_id_rejected() {
-        let mut ctx = context();
+        let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
@@ -402,14 +421,14 @@ mod tests {
         ctx.attached_deposit(NearToken::from_near(1));
         testing_env!(ctx.build());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            c.create_wallet(TASK_ID.to_string(), pk(), 3600, U128::from(1), None, None);
+            let _ = c.create_wallet(TASK_ID.to_string(), pk(), 3600, U128::from(1), None, None);
         }));
         assert!(result.is_err());
     }
 
     #[test]
     fn agent_payment_updates_spent() {
-        let mut ctx = context();
+        let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
@@ -436,7 +455,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "spend cap exceeded")]
     fn spend_cap_enforced() {
-        let mut ctx = context();
+        let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
@@ -456,7 +475,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "wallet expired")]
     fn expired_wallet_refuses_payment() {
-        let mut ctx = context();
+        let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
@@ -477,13 +496,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "does not own this task wallet")]
     fn foreign_key_cannot_spend() {
-        let mut ctx = context();
+        let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
         let other: AccountId = "rogue-agent.near".parse().unwrap();
         let mut ctx = context();
-        let other2 = other.clone();
         ctx.signer_account_id(other.clone());
         ctx.predecessor_account_id(other.clone());
         testing_env!(ctx.build());
@@ -497,7 +515,7 @@ mod tests {
 
     #[test]
     fn owner_can_complete_and_sweep() {
-        let mut ctx = context();
+        let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
@@ -512,7 +530,7 @@ mod tests {
 
     #[test]
     fn anyone_can_force_expire_after_window() {
-        let mut ctx = context();
+        let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
@@ -528,7 +546,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "not expired yet")]
     fn force_expire_before_window_fails() {
-        let mut ctx = context();
+        let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
@@ -555,7 +573,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "agent_call must not attach")]
     fn agent_call_rejects_deposit() {
-        let mut ctx = context();
+        let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
@@ -601,7 +619,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "wallet quarantined")]
     fn quarantined_wallet_refuses_all_calls() {
-        let mut ctx = context();
+        let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         sentinel_wallet(&mut c);
@@ -637,7 +655,7 @@ mod tests {
 
     #[test]
     fn velocity_window_resets_over_time() {
-        let mut ctx = context();
+        let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         sentinel_wallet(&mut c);
@@ -664,7 +682,7 @@ mod tests {
 
     #[test]
     fn canary_payment_sweeps_and_locks() {
-        let mut ctx = context();
+        let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         sentinel_wallet(&mut c);
@@ -721,7 +739,7 @@ mod tests {
 mod fuzz {
     use super::*;
     use near_sdk::test_utils::{VMContextBuilder, accounts};
-    use near_sdk::{testing_env, Gas};
+    use near_sdk::{Gas, testing_env};
 
     fn ctx(deposit: u128) -> VMContextBuilder {
         let mut b = VMContextBuilder::new();
@@ -737,11 +755,41 @@ mod fuzz {
     #[test]
     fn fuzz_hostile_task_ids() {
         let corpus = [
-            "", "a", ".", "..", "a.b", "a..b", ".a", "a.", "-a", "a-", "A", "aB",
-            "a b", "a/b", "a\\b", "a\u{0000}b", "\u{2603}", "0", "9", "aaa",
-            &"x".repeat(33), &"y".repeat(32), &"z".repeat(64), "con", "nul",
-            "a-b_c9", "--", "__", "-_-", "0-9_az", "\u{00e9}tu", "task id",
-            "task;drop", "task%00", "\u{200d}task",
+            "",
+            "a",
+            ".",
+            "..",
+            "a.b",
+            "a..b",
+            ".a",
+            "a.",
+            "-a",
+            "a-",
+            "A",
+            "aB",
+            "a b",
+            "a/b",
+            "a\\b",
+            "a\u{0000}b",
+            "\u{2603}",
+            "0",
+            "9",
+            "aaa",
+            &"x".repeat(33),
+            &"y".repeat(32),
+            &"z".repeat(64),
+            "con",
+            "nul",
+            "a-b_c9",
+            "--",
+            "__",
+            "-_-",
+            "0-9_az",
+            "\u{00e9}tu",
+            "task id",
+            "task;drop",
+            "task%00",
+            "\u{200d}task",
         ];
         for id in corpus {
             let mut c = VMContextBuilder::new();
@@ -755,7 +803,9 @@ mod fuzz {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = contract.create_wallet(
                     id.to_string(),
-                    "ed25519:8h7kFK4t1Pj5wMsmvB5NmMBiF9YZTfbvJdeWPDXCCbT8".parse().unwrap(),
+                    "ed25519:8h7kFK4t1Pj5wMsmvB5NmMBiF9YZTfbvJdeWPDXCCbT8"
+                        .parse()
+                        .unwrap(),
                     3600,
                     U128::from(1_000_000_000_000_000_000_000_000u128),
                     Some(10),
@@ -776,12 +826,14 @@ mod fuzz {
     // Hostile agent_call amounts: zero, max u128, overflow pairs, odd values
     #[test]
     fn fuzz_hostile_amounts() {
-        let mut c = ctx(1_000_000_000_000_000_000_000_000);
+        let c = ctx(1_000_000_000_000_000_000_000_000);
         testing_env!(c.build());
         let mut contract = Contract::new(accounts(2));
         let _ = contract.create_wallet(
             "fuzz-amt".to_string(),
-            "ed25519:8h7kFK4t1Pj5wMsmvB5NmMBiF9YZTfbvJdeWPDXCCbT8".parse().unwrap(),
+            "ed25519:8h7kFK4t1Pj5wMsmvB5NmMBiF9YZTfbvJdeWPDXCCbT8"
+                .parse()
+                .unwrap(),
             3600,
             U128::from(1_000_000_000_000_000_000_000_000u128),
             Some(10),
@@ -789,10 +841,14 @@ mod fuzz {
         );
         let wallet = contract.get_task("fuzz-amt".to_string()).unwrap().wallet;
         let amounts = [
-            0u128, 1, 999_999_999_999_999_999_999_999,
+            0u128,
+            1,
+            999_999_999_999_999_999_999_999,
             1_000_000_000_000_000_000_000_000,
             1_000_000_000_000_000_000_000_001,
-            u128::MAX, u128::MAX - 1, u128::MAX / 2,
+            u128::MAX,
+            u128::MAX - 1,
+            u128::MAX / 2,
             50_000_000_000_000_000_000_000, // exact allowance boundary
         ];
         for amt in amounts {
