@@ -40,8 +40,8 @@ export interface CreateWalletOpts {
 export interface TaskHandle {
   taskId: string;
   wallet: string;
-  /** Full-access secret for the WALLET owner (keep human-side!) */
-  ownerSecret: string;
+  /** Account id recorded on-chain as the task owner (the create_wallet caller) */
+  ownerAccountId: string;
   /** Function-call keypair the AGENT receives (restricted to agent_call) */
   agentSecret: string;
   agentPublicKey: string;
@@ -60,11 +60,16 @@ export class Fukilla {
     this.cfg = cfg;
   }
 
-  /** Create an ephemeral wallet. Owner keypair + agent FC keypair generated locally. */
+  /** Create an ephemeral wallet. Agent FC keypair generated locally.
+   *  IMPORTANT: the contract records the CALLER (predecessor account) as the
+   *  task owner — there is no separate owner keypair in the protocol. The
+   *  caller must be the funded account that will later call complete_task /
+   *  force_expire / lift_quarantine. We return the caller's factory account
+   *  id as `ownerAccountId` so integrators don't mistake a locally generated
+   *  key for the on-chain owner credential. */
   async createWallet(opts: CreateWalletOpts): Promise<TaskHandle> {
-    const near = await this.near();
-    const ownerKp = KeyPair.fromRandom("ed25519");
-    const agentKp = KeyPair.fromRandom("ed25519");
+  const near = await this.near();
+  const agentKp = KeyPair.fromRandom("ed25519");
     const taskId =
       opts.taskId ?? `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -90,7 +95,9 @@ export class Fukilla {
     return {
       taskId,
       wallet: `${taskId}.${this.cfg.factory}`,
-      ownerSecret: ownerKp.toString(),
+      // The on-chain owner is the account that signed create_wallet
+      // (the factory/caller account) — NOT a locally generated keypair.
+      ownerAccountId: this.cfg.factory,
       agentSecret: agentKp.toString(),
       agentPublicKey: agentKp.getPublicKey().toString(),
     };

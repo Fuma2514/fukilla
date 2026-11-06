@@ -100,6 +100,11 @@ How to set it:
 Recommended: set canary to any address from known phishing
 lists in your threat model.
 
+> Note: Canary is a heuristic defense, not a guarantee.
+> An agent with access to the contract source can avoid
+> the canary address. Primary protection comes from
+> spend cap and velocity breaker.
+
 ## Known Limitations
 
 **Task ID squatting:** Any account can call create_wallet

@@ -128,6 +128,13 @@ impl Contract {
                 "velocity window must be 1s..=30d"
             );
         }
+        // A limit without a window gives window_ns = 0: the recency filter
+        // (now - ts < 0 on unsigned) is always false, silently disabling the
+        // breaker. The pair must be provided together or not at all.
+        require!(
+            max_calls_per_window.is_some() == velocity_window_sec.is_some(),
+            "velocity parameters must be provided together or both omitted"
+        );
         // Validate task_id so the derived sub-account is a valid DIRECT sub-account.
         // A task_id containing dots would parse into a nested account that the
         // factory cannot create -> promise failure -> funding stuck + registry
@@ -355,6 +362,7 @@ impl Contract {
             env::predecessor_account_id() == task.owner,
             "only the task owner can lift the quarantine"
         );
+        require!(!task.completed, "cannot lift quarantine on completed task");
         require!(task.quarantined, "wallet not quarantined");
         task.quarantined = false;
         task.call_times = Vec::new();
@@ -785,6 +793,45 @@ mod tests {
             3600,
             U128::from(2_000_000_000_000_000_000_000_000u128),
             Some(50_000),
+            Some(60),
+        );
+    }
+
+    /// A call limit without a window leaves window_ns == 0, which silently
+    /// disables the recency filter (unsigned `now - ts < 0` is never true).
+    /// The pair must be rejected if only one half is supplied.
+    #[test]
+    #[should_panic(expected = "velocity parameters must be provided together")]
+    fn velocity_limit_without_window_rejected() {
+        let mut ctx = context();
+        ctx.attached_deposit(NearToken::from_near(2));
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        let _ = c.create_wallet(
+            "limit-only".to_string(),
+            pk(),
+            3600,
+            U128::from(2_000_000_000_000_000_000_000_000u128),
+            Some(3),
+            None,
+        );
+    }
+
+    /// Mirror case: a window without a limit would store max_calls == 0 and
+    /// leave the breaker off while implying protection.
+    #[test]
+    #[should_panic(expected = "velocity parameters must be provided together")]
+    fn velocity_window_without_limit_rejected() {
+        let mut ctx = context();
+        ctx.attached_deposit(NearToken::from_near(2));
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        let _ = c.create_wallet(
+            "window-only".to_string(),
+            pk(),
+            3600,
+            U128::from(2_000_000_000_000_000_000_000_000u128),
+            None,
             Some(60),
         );
     }
