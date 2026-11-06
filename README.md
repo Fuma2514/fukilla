@@ -54,3 +54,17 @@ cargo near build    # reproducible WASM
 ## License
 
 MIT
+
+## Live proof (testnet, 2026-11-06)
+
+| Action | Result | TX |
+|---|---|---|
+| Factory deployed + initialized | ✅ | `82nihL6tcesZzRYwy8UCyCgWKCiF7mjwTVTobUXFETez` / `8w17hffEXS1GBvSi6dDYckF6VJMvxfyFMmGvKcRVeVmx` |
+| `create_wallet` end-to-end (1 NEAR, SENTINEL 10 calls/60s) | ✅ `e2e-proof-2.fukilla.testnet` born with 1 FC key, 1 NEAR | `Hfa8RKvQacmArfX2vPw9C5ouWeaaCsdgDtNyBK2Biy1N` |
+| Unauthorized `agent_call` (wrong signer) | ✅ **REJECTED** — funds intact, `spent: 0` | rejected tx |
+| Wallet upgraded after live finding | min funding 1 NEAR (executor deploy+storage = 0.845 NEAR measured on-chain) | `6QTzdNN9TZERS2VbJAM4bdgobMPcLET1jCaxagq2qX6J` |
+
+Integration notes for builders:
+- `create_wallet` needs **500 Tgas** prepaid (create + deploy executor WASM + add key).
+- Funding must be **≥ 1 NEAR** (measured storage cost on testnet: 0.845 NEAR).
+- The agent key is function-call-only: `0 full access keys and 1 function-call-only access key` (verified via `near account view-account-summary`).
