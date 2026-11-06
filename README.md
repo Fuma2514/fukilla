@@ -66,7 +66,8 @@ cargo test -- --nocapture
 
 ### Run clippy
 ```bash
-cargo clippy -- -D warnings
+# Note: near-sdk v5 requires wasm32 target for clippy
+cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings
 ```
 
 ### Deploy to testnet
