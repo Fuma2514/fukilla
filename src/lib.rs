@@ -20,6 +20,11 @@ use near_sdk::{AccountId, NearToken, PanicOnDefault, Promise, PublicKey, env, ne
 pub struct Contract {
     owner: AccountId,
     tasks: LookupMap<String, Task>,
+    /// Owner-configured canary bait account: if the agent ever "pays" this
+    /// account, the transfer is silently converted into a sweep-back and the
+    /// wallet is locked forever. Protocol-level honeypot — the canary never
+    /// receives funds, and the "successful payment" is the alarm itself.
+    canary: Option<AccountId>,
 }
 
 #[near(serializers = [json, borsh])]
@@ -39,6 +44,15 @@ pub struct Task {
     pub spent: u128,
     /// True once the wallet has been swept and destroyed
     pub completed: bool,
+    // ---- SENTINEL layers (agent-level defense, on-chain) ----
+    /// Max payments allowed inside the velocity window (0 = disabled)
+    pub max_calls_per_window: u32,
+    /// Velocity window length in nanoseconds
+    pub velocity_window_ns: u64,
+    /// Timestamps (ns) of payments inside the current velocity window
+    pub call_times: Vec<u64>,
+    /// True once the wallet has quarantined itself (locked, awaiting owner)
+    pub quarantined: bool,
 }
 
 /// Path to the pre-built executor WASM that gets deployed onto every wallet.
@@ -48,7 +62,7 @@ const EXECUTOR_WASM: &[u8] = include_bytes!("../executor.wasm");
 impl Contract {
     #[init]
     pub fn new(owner: AccountId) -> Self {
-        Self { owner, tasks: LookupMap::new(b"t") }
+        Self { owner, tasks: LookupMap::new(b"t"), canary: None }
     }
 
     /// Create an ephemeral wallet for a task. The attached deposit funds the
@@ -62,6 +76,8 @@ impl Contract {
         agent_key: PublicKey,
         ttl_sec: u64,
         spend_cap: U128,
+        max_calls_per_window: Option<u32>,
+        velocity_window_sec: Option<u64>,
     ) -> Promise {
         let funding = env::attached_deposit();
         require!(funding > NearToken::from_yoctonear(0), "deposit required");
@@ -104,6 +120,10 @@ impl Contract {
                 spend_cap: cap,
                 spent: 0,
                 completed: false,
+                max_calls_per_window: max_calls_per_window.unwrap_or(0),
+                velocity_window_ns: velocity_window_sec.unwrap_or(0) * 1_000_000_000,
+                call_times: Vec::new(),
+                quarantined: false,
             },
         );
 
@@ -155,17 +175,62 @@ impl Contract {
             .expect("unknown task");
         require!(signer == task.wallet, "this key does not own this task wallet");
         require!(!task.completed, "wallet already destroyed");
+        // ---- LAYER: quarantine gate ---- a quarantined wallet accepts nothing.
+        require!(!task.quarantined, "wallet quarantined: behavior flagged");
         require!(
             env::block_timestamp() < task.expiry_ts,
             "wallet expired: spending window closed"
         );
 
+        // ---- LAYER: velocity circuit breaker (on-chain self-quarantine) ----
+        // A violating call does NOT panic (a panic rolls back and destroys the
+        // evidence). Instead the transaction SUCCEEDS without paying anything
+        // and the wallet locks itself forever: permanent, unerasable on-chain
+        // proof that the agent attempted anomalous behavior.
+        let mut t = task;
+        if t.max_calls_per_window > 0 {
+            let now = env::block_timestamp();
+            let window_ns = t.velocity_window_ns;
+            let mut recent: Vec<u64> = t
+                .call_times
+                .iter()
+                .copied()
+                .filter(|ts| now.saturating_sub(*ts) < window_ns)
+                .collect();
+            if recent.len() >= t.max_calls_per_window as usize {
+                t.quarantined = true;
+                t.call_times = recent;
+                self.tasks.insert(task_id.clone(), t.clone());
+                env::log_str(&format!(
+                    "{{\"event\":\"velocity_quarantine\",\"task_id\":\"{}\",\"attempts_in_window\":\"{}\"}}",
+                    task_id, t.max_calls_per_window
+                ));
+                return Promise::new(t.owner.clone()).transfer(NearToken::from_yoctonear(0));
+            }
+            recent.push(now);
+            t.call_times = recent;
+        }
+
         let amount: u128 = amount.into();
-        let new_spent = task.spent + amount;
-        require!(new_spent <= task.spend_cap, "spend cap exceeded");
+        let new_spent = t.spent + amount;
+        require!(new_spent <= t.spend_cap, "spend cap exceeded");
+
+        // ---- LAYER: canary honeypot (protocol-level bait) ----
+        // If the agent ever "pays" the canary, no funds ever reach the bait:
+        // the wallet locks itself permanently and everything sweeps back to
+        // the owner. A "successful" canary payment IS the alarm.
+        if self.canary == Some(receiver_id.clone()) {
+            t.spent = new_spent;
+            t.quarantined = true;
+            t.completed = true;
+            env::log_str(&format!(
+                "{{\"event\":\"canary_triggered\",\"task_id\":\"{}\",\"receiver\":\"{}\"}}",
+                task_id, receiver_id
+            ));
+            return self.finalize(task_id, t);
+        }
 
         // Update state BEFORE the external call (reentrancy hygiene).
-        let mut t = task;
         t.spent = new_spent;
         self.tasks.insert(task_id.clone(), t);
 
@@ -175,6 +240,28 @@ impl Contract {
         ));
 
         Promise::new(receiver_id).transfer(NearToken::from_yoctonear(amount))
+    }
+
+    /// Owner sets the canary bait account (honeypot). Only the factory owner.
+    pub fn set_canary(&mut self, canary: AccountId) {
+        require!(
+            env::predecessor_account_id() == self.owner,
+            "only the factory owner can set the canary"
+        );
+        self.canary = Some(canary);
+    }
+
+    /// Owner clears the quarantine after reviewing the incident.
+    pub fn lift_quarantine(&mut self, task_id: String) {
+        let mut task = self.tasks.get(&task_id).cloned().expect("unknown task");
+        require!(
+            env::predecessor_account_id() == task.owner,
+            "only the task owner can lift the quarantine"
+        );
+        require!(task.quarantined, "wallet not quarantined");
+        task.quarantined = false;
+        task.call_times = Vec::new();
+        self.tasks.insert(task_id, task);
     }
 
     /// Owner closes the task: sweeps the remaining balance back to the owner
@@ -279,6 +366,8 @@ mod tests {
             pk(),
             3600,
             U128::from(1_000_000_000_000_000_000_000_000u128),
+            Some(30),
+            Some(3600),
         );
     }
 
@@ -305,7 +394,7 @@ mod tests {
         ctx.attached_deposit(NearToken::from_near(1));
         testing_env!(ctx.build());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            c.create_wallet(TASK_ID.to_string(), pk(), 3600, U128::from(1));
+            c.create_wallet(TASK_ID.to_string(), pk(), 3600, U128::from(1), None, None);
         }));
         assert!(result.is_err());
     }
@@ -450,6 +539,8 @@ mod tests {
             pk(),
             3600,
             U128::from(1_000_000_000_000_000_000_000_000u128),
+            None,
+            None,
         );
     }
 
@@ -473,5 +564,113 @@ mod tests {
             U128::from(1),
             "with-deposit".to_string(),
         );
+    }
+
+    fn sentinel_wallet(c: &mut Contract) {
+        // wallet with velocity limit 2 calls / 60s
+        let mut ctx = context();
+        ctx.attached_deposit(NearToken::from_near(1));
+        testing_env!(ctx.build());
+        let _ = c.create_wallet(
+            "sentinel-task".to_string(),
+            pk(),
+            3600,
+            U128::from(1_000_000_000_000_000_000_000_000u128),
+            Some(2),
+            Some(60),
+        );
+    }
+
+    fn wallet_ctx(task_wallet: &AccountId, ts: u64) {
+        let mut ctx = context();
+        ctx.signer_account_id(task_wallet.clone());
+        ctx.predecessor_account_id(task_wallet.clone());
+        ctx.block_timestamp(ts);
+        ctx.prepaid_gas(Gas::from_tgas(100));
+        testing_env!(ctx.build());
+    }
+
+    #[test]
+    #[should_panic(expected = "wallet quarantined")]
+    fn quarantined_wallet_refuses_all_calls() {
+        let mut ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        sentinel_wallet(&mut c);
+        let wallet = c.get_task("sentinel-task".to_string()).unwrap().wallet;
+        // 3 rapid calls within the window: 3rd attempt quarantines... actually
+        // the 3rd SILENTLY quarantines (no panic), so simulate: two ok calls, third locks
+        for i in 0..2u64 {
+            wallet_ctx(&wallet, i);
+            let _ = c.agent_call(
+                "sentinel-task".to_string(),
+                "api-provider.near".parse().unwrap(),
+                U128::from(100_000_000_000_000_000_000_000u128),
+                format!("call-{i}"),
+            );
+        }
+        wallet_ctx(&wallet, 2);
+        let _ = c.agent_call(
+            "sentinel-task".to_string(),
+            "api-provider.near".parse().unwrap(),
+            U128::from(100_000_000_000_000_000_000_000u128),
+            "burst".to_string(),
+        );
+        assert!(c.get_task("sentinel-task".to_string()).unwrap().quarantined);
+        // any further call panics on quarantine gate
+        wallet_ctx(&wallet, 3);
+        let _ = c.agent_call(
+            "sentinel-task".to_string(),
+            "api-provider.near".parse().unwrap(),
+            U128::from(1),
+            "after-lock".to_string(),
+        );
+    }
+
+    #[test]
+    fn velocity_window_resets_over_time() {
+        let mut ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        sentinel_wallet(&mut c);
+        let wallet = c.get_task("sentinel-task".to_string()).unwrap().wallet;
+        for i in 0..2u64 {
+            wallet_ctx(&wallet, i);
+            let _ = c.agent_call(
+                "sentinel-task".to_string(),
+                "api-provider.near".parse().unwrap(),
+                U128::from(100_000_000_000_000_000_000_000u128),
+                format!("call-{i}"),
+            );
+        }
+        // far outside the 60s window -> old calls expire, allowed again
+        wallet_ctx(&wallet, 120 * 1_000_000_000);
+        let _ = c.agent_call(
+            "sentinel-task".to_string(),
+            "api-provider.near".parse().unwrap(),
+            U128::from(100_000_000_000_000_000_000_000u128),
+            "later".to_string(),
+        );
+        assert!(!c.get_task("sentinel-task".to_string()).unwrap().quarantined);
+    }
+
+    #[test]
+    fn canary_payment_sweeps_and_locks() {
+        let mut ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        sentinel_wallet(&mut c);
+        c.set_canary("bait.near".parse().unwrap());
+        let wallet = c.get_task("sentinel-task".to_string()).unwrap().wallet;
+        wallet_ctx(&wallet, 0);
+        let _ = c.agent_call(
+            "sentinel-task".to_string(),
+            "bait.near".parse().unwrap(),
+            U128::from(100_000_000_000_000_000_000_000u128),
+            "oops".to_string(),
+        );
+        let t = c.get_task("sentinel-task".to_string()).unwrap();
+        assert!(t.quarantined);
+        assert!(t.completed);
     }
 }
