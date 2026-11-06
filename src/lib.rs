@@ -86,6 +86,14 @@ impl Contract {
         require!(ttl_sec > 0 && ttl_sec <= 30 * 24 * 3600, "ttl out of range");
         let cap: u128 = spend_cap.into();
         require!(cap > 0, "spend cap must be positive");
+        // SENTINEL sanity caps: prevent unbounded velocity bookkeeping (gas
+        // griefing) and u64 overflow when converting the window to nanoseconds.
+        if let Some(n) = max_calls_per_window {
+            require!(n > 0 && n <= 10_000, "max_calls_per_window must be 1..=10000");
+        }
+        if let Some(w) = velocity_window_sec {
+            require!(w > 0 && w <= 30 * 24 * 3600, "velocity window must be 1s..=30d");
+        }
         // Validate task_id so the derived sub-account is a valid DIRECT sub-account.
         // A task_id containing dots would parse into a nested account that the
         // factory cannot create -> promise failure -> funding stuck + registry
@@ -672,5 +680,39 @@ mod tests {
         let t = c.get_task("sentinel-task".to_string()).unwrap();
         assert!(t.quarantined);
         assert!(t.completed);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_calls_per_window must be")]
+    fn insane_velocity_cap_rejected() {
+        let mut ctx = context();
+        ctx.attached_deposit(NearToken::from_near(1));
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        let _ = c.create_wallet(
+            "gas-grief".to_string(),
+            pk(),
+            3600,
+            U128::from(1_000_000_000_000_000_000_000_000u128),
+            Some(50_000),
+            Some(60),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "velocity window must be")]
+    fn insane_velocity_window_rejected() {
+        let mut ctx = context();
+        ctx.attached_deposit(NearToken::from_near(1));
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        let _ = c.create_wallet(
+            "big-window".to_string(),
+            pk(),
+            3600,
+            U128::from(1_000_000_000_000_000_000_000_000u128),
+            Some(30),
+            Some(400 * 24 * 3600),
+        );
     }
 }
