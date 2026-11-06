@@ -30,8 +30,8 @@ Every AI agent that touches crypto has the same fatal design flaw: it holds a fu
 
 ### Live on NEAR testnet
 
-- Factory: `ephwallet.testnet`
-- Demo wallet: `demo-task-1.ephwallet.testnet` (funded with 1 NEAR, FC key capped at 0.05 NEAR)
+- Factory: `fukilla.testnet`
+- Demo wallet: `e2e-proof-2.fukilla.testnet` (funded with 1 NEAR, FC key capped at 0.1 NEAR)
 - Create wallet tx: [`9ZCX8DJ2FPdGFaAmAt6aci9qWi2usdWLtkjMAmBYKugR`](https://testnet.nearblocks.io/tx/9ZCX8DJ2FPdGFaAmAt6aci9qWi2usdWLtkjMAmBYKugR)
 
 ### Security properties
@@ -42,12 +42,21 @@ Every AI agent that touches crypto has the same fatal design flaw: it holds a fu
 4. **Self-destruct** — `complete_task` returns all remaining balance to the owner and deletes the account, so leaked keys become worthless
 5. **Zero trust** — the owner never shares their main key with anyone, ever
 
+## Bugs found & fixed during development
+
+We publish these because a security project that claims to be flawless is the least credible one on the table.
+
+1. **Payments came from the factory, not the task wallet.** In `agent_call`, the transfer was executed by the factory contract — meaning all tasks shared one pool of funds, contradicting the "isolated per-task wallet" claim. **Fix (commit `13a067d`):** the factory now forwards a `pay(receiver, amount)` call to the executor sub-account, which transfers from its own balance after verifying the caller is its parent factory. Isolation is now real at the protocol level.
+2. **Refunds sent 0 NEAR.** The failure callback refunded `env::attached_deposit()` — which is always **0 inside a NEAR callback**, so a failed `create_wallet` silently kept the owner's deposit. **Fix (commit `13a067d`):** the attached deposit is stored in task state (`funding`) *before* the promise chain starts, and the callback refunds from that stored value.
+3. **Minimum funding was too low (found live).** A 0.05 NEAR funding failed on-chain: deploying the executor WASM + storage staking costs a measured **0.845 NEAR**, and with only 1 NEAR the wallet's liquid balance after staking was too thin for the agent's gas. **Fix (commits `9996a16`, `13a067d`):** minimum funding raised to **2 NEAR**, proven by the sandbox integration test.
+4. **Debugging lesson:** a `env::account_balance()` comparison inside the executor caused a silent wasm trap (panic=abort swallows messages); it was removed — the runtime already fails a transfer exceeding the wallet's balance, and the factory's spend cap bounds total outflow.
+
 ## Built at NEAR HACKATHON (security track), November 2026
 
 ## Build & test
 
 ```bash
-cargo test          # 9 unit tests + 1 integration test
+cargo test          # 19 unit tests + 1 integration test
 cargo near build    # reproducible WASM
 ```
 
