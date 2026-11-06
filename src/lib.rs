@@ -86,9 +86,12 @@ impl Contract {
         let funding = env::attached_deposit();
         require!(funding > NearToken::from_yoctonear(0), "deposit required");
         // Sub-account creation + FC key + storage needs a minimum; reject tiny wallets.
+        // Sub-account creation + executor WASM deploy + FC key + storage costs
+        // ~0.845 NEAR on-chain; require 1 NEAR so the promise chain never fails
+        // on storage (live E2E verified 2026-11-06).
         require!(
-            funding.as_yoctonear() >= 50_000_000_000_000_000_000_000,
-            "min 0.05 NEAR funding"
+            funding.as_yoctonear() >= 1_000_000_000_000_000_000_000_000,
+            "min 1 NEAR funding (covers executor deploy + storage)"
         );
         require!(ttl_sec > 0 && ttl_sec <= 30 * 24 * 3600, "ttl out of range");
         let cap: u128 = spend_cap.into();
@@ -870,5 +873,20 @@ mod fuzz {
             let t = contract.get_task("fuzz-amt".to_string()).unwrap();
             assert!(t.spent <= t.spend_cap, "CAP VIOLATED at {}", amt);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "min 1 NEAR funding")]
+    fn underfunded_wallet_rejected() {
+        testing_env!(ctx(50_000_000_000_000_000_000_000).build());
+        let mut c = Contract::new(accounts(2));
+        let _ = c.create_wallet(
+            "tiny".to_string(),
+            "ed25519:8h7kFK4t1Pj5wMsmvB5NmMBiF9YZTfbvJdeWPDXCCbT8".parse().unwrap(),
+            3600,
+            U128::from(1_000_000_000_000_000_000_000_000u128),
+            None,
+            None,
+        );
     }
 }
