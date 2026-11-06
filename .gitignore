@@ -1,0 +1,5 @@
+/target
+/executor/target
+node_modules
+.env
+*.local
