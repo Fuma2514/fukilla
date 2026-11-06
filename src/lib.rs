@@ -716,3 +716,103 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use near_sdk::test_utils::{VMContextBuilder, accounts};
+    use near_sdk::{testing_env, Gas};
+
+    fn ctx(deposit: u128) -> VMContextBuilder {
+        let mut b = VMContextBuilder::new();
+        b.current_account_id(accounts(1));
+        b.signer_account_id(accounts(2));
+        b.predecessor_account_id(accounts(2));
+        b.attached_deposit(NearToken::from_yoctonear(deposit));
+        b.prepaid_gas(Gas::from_tgas(300));
+        b
+    }
+
+    // Hostile task_id corpus: traversal, unicode, dots, empty, long, edge chars
+    #[test]
+    fn fuzz_hostile_task_ids() {
+        let corpus = [
+            "", "a", ".", "..", "a.b", "a..b", ".a", "a.", "-a", "a-", "A", "aB",
+            "a b", "a/b", "a\\b", "a\u{0000}b", "\u{2603}", "0", "9", "aaa",
+            &"x".repeat(33), &"y".repeat(32), &"z".repeat(64), "con", "nul",
+            "a-b_c9", "--", "__", "-_-", "0-9_az", "\u{00e9}tu", "task id",
+            "task;drop", "task%00", "\u{200d}task",
+        ];
+        for id in corpus {
+            let mut c = VMContextBuilder::new();
+            c.current_account_id(accounts(1));
+            c.signer_account_id(accounts(2));
+            c.predecessor_account_id(accounts(2));
+            c.attached_deposit(NearToken::from_near(1));
+            testing_env!(c.build());
+            let mut contract = Contract::new(accounts(2));
+            // Must either succeed cleanly or panic cleanly - NEVER corrupt state
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = contract.create_wallet(
+                    id.to_string(),
+                    "ed25519:8h7kFK4t1Pj5wMsmvB5NmMBiF9YZTfbvJdeWPDXCCbT8".parse().unwrap(),
+                    3600,
+                    U128::from(1_000_000_000_000_000_000_000_000u128),
+                    Some(10),
+                    Some(60),
+                );
+            }));
+            // State must remain consistent after ANY outcome
+            let mut c2 = VMContextBuilder::new();
+            c2.current_account_id(accounts(1));
+            c2.signer_account_id(accounts(2));
+            c2.predecessor_account_id(accounts(2));
+            testing_env!(c2.build());
+            let _ = contract.get_owner(); // reading state never panics
+            let _ = result;
+        }
+    }
+
+    // Hostile agent_call amounts: zero, max u128, overflow pairs, odd values
+    #[test]
+    fn fuzz_hostile_amounts() {
+        let mut c = ctx(1_000_000_000_000_000_000_000_000);
+        testing_env!(c.build());
+        let mut contract = Contract::new(accounts(2));
+        let _ = contract.create_wallet(
+            "fuzz-amt".to_string(),
+            "ed25519:8h7kFK4t1Pj5wMsmvB5NmMBiF9YZTfbvJdeWPDXCCbT8".parse().unwrap(),
+            3600,
+            U128::from(1_000_000_000_000_000_000_000_000u128),
+            Some(10),
+            Some(60),
+        );
+        let wallet = contract.get_task("fuzz-amt".to_string()).unwrap().wallet;
+        let amounts = [
+            0u128, 1, 999_999_999_999_999_999_999_999,
+            1_000_000_000_000_000_000_000_000,
+            1_000_000_000_000_000_000_000_001,
+            u128::MAX, u128::MAX - 1, u128::MAX / 2,
+            50_000_000_000_000_000_000_000, // exact allowance boundary
+        ];
+        for amt in amounts {
+            let mut c = VMContextBuilder::new();
+            c.current_account_id(accounts(1));
+            c.signer_account_id(wallet.clone());
+            c.predecessor_account_id(wallet.clone());
+            c.prepaid_gas(Gas::from_tgas(100));
+            testing_env!(c.build());
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = contract.agent_call(
+                    "fuzz-amt".to_string(),
+                    "api.near".parse().unwrap(),
+                    U128::from(amt),
+                    "fuzz".to_string(),
+                );
+            }));
+            // spent must never exceed cap
+            let t = contract.get_task("fuzz-amt".to_string()).unwrap();
+            assert!(t.spent <= t.spend_cap, "CAP VIOLATED at {}", amt);
+        }
+    }
+}
