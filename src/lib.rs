@@ -70,6 +70,18 @@ impl Contract {
         require!(ttl_sec > 0 && ttl_sec <= 30 * 24 * 3600, "ttl out of range");
         let cap: u128 = spend_cap.into();
         require!(cap > 0, "spend cap must be positive");
+        // Validate task_id so the derived sub-account is a valid DIRECT sub-account.
+        // A task_id containing dots would parse into a nested account that the
+        // factory cannot create -> promise failure -> funding stuck + registry
+        // entry burned forever.
+        require!(
+            !task_id.is_empty()
+                && task_id.len() <= 32
+                && task_id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+                && !task_id.starts_with('-')
+                && !task_id.ends_with('-'),
+            "task_id must be 1-32 chars: a-z, 0-9, '-', '_'"
+        );
 
         let wallet: AccountId = format!("{}.{}", task_id, env::current_account_id())
             .parse()
@@ -132,6 +144,9 @@ impl Contract {
         let signer = env::signer_account_id();
         let predecessor = env::predecessor_account_id();
         require!(signer == predecessor, "must be called directly with the agent key");
+        // Reject stray deposits: an FC key CAN attach deposits (bounded by allowance)
+        // and any attached deposit would be silently stranded in the factory.
+        require!(env::attached_deposit() == NearToken::from_yoctonear(0), "agent_call must not attach a deposit");
 
         let task = self
             .tasks
@@ -421,5 +436,42 @@ mod tests {
         let mut c = Contract::new(accounts(2));
         create(&mut c);
         let _ = c.force_expire(TASK_ID.to_string());
+    }
+
+    #[test]
+    #[should_panic(expected = "task_id must be")]
+    fn dotted_task_id_rejected() {
+        let mut ctx = context();
+        ctx.attached_deposit(NearToken::from_near(1));
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        let _ = c.create_wallet(
+            "bad.dotted".to_string(),
+            pk(),
+            3600,
+            U128::from(1_000_000_000_000_000_000_000_000u128),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "agent_call must not attach")]
+    fn agent_call_rejects_deposit() {
+        let mut ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        create(&mut c);
+        let wallet = c.get_task(TASK_ID.to_string()).unwrap().wallet;
+        let mut ctx = context();
+        ctx.signer_account_id(wallet.clone());
+        ctx.predecessor_account_id(wallet.clone());
+        ctx.attached_deposit(NearToken::from_yoctonear(1));
+        ctx.prepaid_gas(Gas::from_tgas(100));
+        testing_env!(ctx.build());
+        let _ = c.agent_call(
+            TASK_ID.to_string(),
+            "api-provider.near".parse().unwrap(),
+            U128::from(1),
+            "with-deposit".to_string(),
+        );
     }
 }
