@@ -1,7 +1,6 @@
 # FUKILLA — Hackathon Submission
 
-FUKILLA gives AI agents a sandboxed wallet with hard limits
-enforced on-chain — no backend, no oracle, no server.
+FUKILLA — a self-enforcing, serverless security layer for autonomous AI agent funds.
 
 Each task gets its own sub-account. The agent gets one
 function-call key. Rules live inside the contract: spend

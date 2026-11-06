@@ -4,9 +4,9 @@
 
 *"Burn after paying" — the wallet self-destructs after the task ends; all remaining funds return to the owner. Nothing is lost.*
 
-FUKILLA is a security-first wallet factory on NEAR Protocol that gives AI agents money **without giving them the keys**.
+*FUKILLA — A self-enforcing, serverless security layer for autonomous AI agent funds.*
 
-Every AI agent that touches crypto has the same fatal design flaw: it holds a full private key to your funds. One leaked key, one prompt injection, one hallucination — everything gone. FUKILLA flips the model:
+Every AI agent that touches crypto has the same fatal design flaw: it holds a full private key to your funds. One leaked key, one compromised instruction, one hallucination — everything gone. FUKILLA prevents compromised AI agents from exceeding predefined on-chain security policies:
 
 - The **owner** funds a fresh, disposable wallet per task ("a Fukilla") through the factory
 - The **agent** receives exactly one **Function-Call access key**, scoped to a single method (`agent_call`), with a hard on-chain allowance (spend cap)
