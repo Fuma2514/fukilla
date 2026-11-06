@@ -45,7 +45,7 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
             }),
         )
         .transaction()
-        .deposit(NearToken::from_near(1))
+        .deposit(NearToken::from_near(2))
         .gas(NearGas::from_tgas(100))
         .with_signer(owner.account_id().clone(), signer.clone())
         .send_to(&sandbox_network)
@@ -94,7 +94,15 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
             near_api::Signer::from_secret_key(agent_keypair.clone())?,
         )
         .send_to(&sandbox_network)
-        .await?
+        .await
+        .map(|r| {
+            eprintln!("DEBUG_AGENT_TX_OUTCOME: {:?}", r);
+            r
+        })
+        .map_err(|e| {
+            eprintln!("DEBUG_AGENT_TX_ERR: {e:?}");
+            e
+        })?
         .assert_success();
 
     let remaining_bytes = contract

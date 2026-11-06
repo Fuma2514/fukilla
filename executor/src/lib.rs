@@ -5,7 +5,7 @@
 //! Guard: only the factory contract (the wallet's parent) may call this.
 //! The agent's function-call key cannot reach this method — its key is
 //! restricted to `agent_call` on the factory.
-use near_sdk::{AccountId, env, near, require};
+use near_sdk::{AccountId, NearToken, env, near, require};
 
 #[near(contract_state)]
 #[derive(Default)]
@@ -30,5 +30,27 @@ impl Executor {
             beneficiary
         ));
         near_sdk::Promise::new(env::current_account_id()).delete_account(beneficiary);
+    }
+
+    /// Pay `amount` yoctoNEAR from THIS wallet's own balance to `receiver`.
+    /// Callable only by the factory (the wallet's parent), which is where all
+    /// FUKILLA policy checks (spend cap, velocity, canary, expiry, quarantine)
+    /// have already passed. Funds genuinely leave the sub-account — the task's
+    /// own balance — never the factory's.
+    pub fn pay(receiver: AccountId, amount: near_sdk::json_types::U128) {
+        require!(
+            env::predecessor_account_id()
+                == env::current_account_id()
+                    .as_str()
+                    .split_once('.')
+                    .map(|(_, parent)| parent.to_string())
+                    .unwrap_or_default(),
+            "only the factory can pay from this wallet"
+        );
+        let amount: u128 = amount.into();
+        // NOTE: no explicit reserve check — a transfer larger than the
+        // wallet's balance simply fails at the runtime level, and the
+        // factory's spend_cap already bounds the total outflow.
+        near_sdk::Promise::new(receiver).transfer(NearToken::from_yoctonear(amount));
     }
 }

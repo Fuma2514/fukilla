@@ -53,10 +53,25 @@ pub struct Task {
     pub call_times: Vec<u64>,
     /// True once the wallet has quarantined itself (locked, awaiting owner)
     pub quarantined: bool,
+    /// Funding actually attached at creation time; kept in state so the
+    /// on_wallet_created callback can refund it (attached_deposit() is 0
+    /// inside a callback — NEAR runtime resets context).
+    pub funding: u128,
 }
 
 /// Path to the pre-built executor WASM that gets deployed onto every wallet.
 const EXECUTOR_WASM: &[u8] = include_bytes!("../executor.wasm");
+
+/// Headroom added on top of the spend cap for the FC key's protocol-level
+/// allowance, which covers gas burnt by transactions signed with that key
+/// (up to ~100 Tgas at a 1e9 yoctoNEAR/gas price = 0.1 NEAR). The real
+/// spend limit is enforced in contract state (spend_cap), never by this.
+const GAS_ALLOWANCE_MARGIN: u128 = 500_000_000_000_000_000_000_000_000; // 0.5 NEAR gas headroom
+// NOTE: NEAR allowance covers gas burnt by txs signed with this key AND
+// deposits. Sandbox/testnet gas price is dynamic, so a fixed margin must
+// cover the worst realistic case (~300 Tgas x 1e10 = 3 NEAR). The true
+// spend limit is spend_cap, enforced in contract state (spent <= cap),
+// never by the allowance. The wallet's own balance still bounds everything.
 
 #[near]
 impl Contract {
@@ -89,9 +104,12 @@ impl Contract {
         // Sub-account creation + executor WASM deploy + FC key + storage costs
         // ~0.845 NEAR on-chain; require 1 NEAR so the promise chain never fails
         // on storage (live E2E verified 2026-11-06).
+        // 2 NEAR: executor WASM storage (~1 NEAR for ~100 KB) + agent gas
+        // headroom. With 1 NEAR the wallet's liquid balance after storage
+        // stake is too small for the agent to pay tx gas (live E2E verified).
         require!(
-            funding.as_yoctonear() >= 1_000_000_000_000_000_000_000_000,
-            "min 1 NEAR funding (covers executor deploy + storage)"
+            funding.as_yoctonear() >= 2_000_000_000_000_000_000_000_000,
+            "min 2 NEAR funding (executor storage + agent gas headroom)"
         );
         require!(ttl_sec > 0 && ttl_sec <= 30 * 24 * 3600, "ttl out of range");
         let cap: u128 = spend_cap.into();
@@ -147,6 +165,7 @@ impl Contract {
                 velocity_window_ns: velocity_window_sec.unwrap_or(0) * 1_000_000_000,
                 call_times: Vec::new(),
                 quarantined: false,
+                funding: funding.as_yoctonear(),
             },
         );
 
@@ -156,7 +175,11 @@ impl Contract {
             .deploy_contract(EXECUTOR_WASM.to_vec())
             .add_access_key_allowance(
                 agent_key,
-                Allowance::limited(NearToken::from_yoctonear(cap))
+                // NEAR allowance covers BOTH attached deposits AND gas burnt by
+                // txs signed with this key. The spend cap is enforced exactly in
+                // contract state (spent vs cap); the allowance needs headroom so
+                // legitimate gas costs never block a compliant payment.
+                Allowance::limited(NearToken::from_yoctonear(cap + GAS_ALLOWANCE_MARGIN))
                     .expect("spend cap must be positive"),
                 env::current_account_id(),
                 "agent_call".to_string(),
@@ -171,9 +194,11 @@ impl Contract {
             funding.as_yoctonear(),
         ));
 
-        promise.then(
-            Self::ext(env::current_account_id()).on_wallet_created(task_id.clone(), owner.clone()),
-        )
+        promise.then(Self::ext(env::current_account_id()).on_wallet_created(
+            task_id.clone(),
+            owner.clone(),
+            U128::from(funding.as_yoctonear()),
+        ))
     }
 
     /// Callback: create-promise chain finished. If any step of
@@ -181,7 +206,7 @@ impl Contract {
     /// funding to the owner and remove the dead registry entry, so a failed
     /// creation can never strand funds or pollute the task registry.
     #[private]
-    pub fn on_wallet_created(&mut self, task_id: String, owner: AccountId) {
+    pub fn on_wallet_created(&mut self, task_id: String, owner: AccountId, funding: U128) {
         let ok = env::promise_result_checked(0, 0).is_ok();
         if !ok {
             // Roll back: forget the task; the sub-account was never usable,
@@ -191,8 +216,11 @@ impl Contract {
                 "{{\"event\":\"wallet_creation_failed\",\"task_id\":\"{}\",\"refund_to\":\"{}\"}}",
                 task_id, owner
             ));
+            // NEAR runtime: attached_deposit() is always 0 inside a callback,
+            // so the refund amount is the funding persisted in the Task
+            // BEFORE the promise chain started (passed into this callback).
             Promise::new(owner)
-                .transfer(env::attached_deposit())
+                .transfer(NearToken::from_yoctonear(funding.0))
                 .detach();
         } else {
             env::log_str(&format!(
@@ -287,6 +315,7 @@ impl Contract {
         }
 
         // Update state BEFORE the external call (reentrancy hygiene).
+        let wallet = t.wallet.clone();
         t.spent = new_spent;
         self.tasks.insert(task_id.clone(), t);
 
@@ -295,7 +324,19 @@ impl Contract {
             task_id, receiver_id, amount, new_spent, memo
         ));
 
-        Promise::new(receiver_id).transfer(NearToken::from_yoctonear(amount))
+        // Funds leave the TASK SUB-ACCOUNT, not the factory: the factory
+        // instructs the wallet's executor to pay from the wallet's own
+        // balance. Isolation is real at the protocol level.
+        Promise::new(wallet).function_call(
+            "pay".to_string(),
+            near_sdk::serde_json::to_vec(&near_sdk::serde_json::json!({
+                "receiver": receiver_id,
+                "amount": amount.to_string()
+            }))
+            .expect("json serialize"),
+            NearToken::from_yoctonear(0),
+            near_sdk::Gas::from_tgas(5),
+        )
     }
 
     /// Owner sets the canary bait account (honeypot). Only the factory owner.
@@ -417,7 +458,7 @@ mod tests {
 
     fn create(contract: &mut Contract) {
         let mut ctx = context();
-        ctx.attached_deposit(NearToken::from_near(1));
+        ctx.attached_deposit(NearToken::from_near(2));
         testing_env!(ctx.build());
         let _ = contract.create_wallet(
             TASK_ID.to_string(),
@@ -449,7 +490,7 @@ mod tests {
         let mut c = Contract::new(accounts(2));
         create(&mut c);
         let mut ctx = context();
-        ctx.attached_deposit(NearToken::from_near(1));
+        ctx.attached_deposit(NearToken::from_near(2));
         testing_env!(ctx.build());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = c.create_wallet(TASK_ID.to_string(), pk(), 3600, U128::from(1), None, None);
@@ -588,14 +629,14 @@ mod tests {
     #[should_panic(expected = "task_id must be")]
     fn dotted_task_id_rejected() {
         let mut ctx = context();
-        ctx.attached_deposit(NearToken::from_near(1));
+        ctx.attached_deposit(NearToken::from_near(2));
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         let _ = c.create_wallet(
             "bad.dotted".to_string(),
             pk(),
             3600,
-            U128::from(1_000_000_000_000_000_000_000_000u128),
+            U128::from(2_000_000_000_000_000_000_000_000u128),
             None,
             None,
         );
@@ -626,13 +667,13 @@ mod tests {
     fn sentinel_wallet(c: &mut Contract) {
         // wallet with velocity limit 2 calls / 60s
         let mut ctx = context();
-        ctx.attached_deposit(NearToken::from_near(1));
+        ctx.attached_deposit(NearToken::from_near(2));
         testing_env!(ctx.build());
         let _ = c.create_wallet(
             "sentinel-task".to_string(),
             pk(),
             3600,
-            U128::from(1_000_000_000_000_000_000_000_000u128),
+            U128::from(2_000_000_000_000_000_000_000_000u128),
             Some(2),
             Some(60),
         );
@@ -735,14 +776,14 @@ mod tests {
     #[should_panic(expected = "max_calls_per_window must be")]
     fn insane_velocity_cap_rejected() {
         let mut ctx = context();
-        ctx.attached_deposit(NearToken::from_near(1));
+        ctx.attached_deposit(NearToken::from_near(2));
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         let _ = c.create_wallet(
             "gas-grief".to_string(),
             pk(),
             3600,
-            U128::from(1_000_000_000_000_000_000_000_000u128),
+            U128::from(2_000_000_000_000_000_000_000_000u128),
             Some(50_000),
             Some(60),
         );
@@ -752,14 +793,14 @@ mod tests {
     #[should_panic(expected = "velocity window must be")]
     fn insane_velocity_window_rejected() {
         let mut ctx = context();
-        ctx.attached_deposit(NearToken::from_near(1));
+        ctx.attached_deposit(NearToken::from_near(2));
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         let _ = c.create_wallet(
             "big-window".to_string(),
             pk(),
             3600,
-            U128::from(1_000_000_000_000_000_000_000_000u128),
+            U128::from(2_000_000_000_000_000_000_000_000u128),
             Some(30),
             Some(400 * 24 * 3600),
         );
@@ -827,7 +868,7 @@ mod fuzz {
             c.current_account_id(accounts(1));
             c.signer_account_id(accounts(2));
             c.predecessor_account_id(accounts(2));
-            c.attached_deposit(NearToken::from_near(1));
+            c.attached_deposit(NearToken::from_near(2));
             testing_env!(c.build());
             let mut contract = Contract::new(accounts(2));
             // Must either succeed cleanly or panic cleanly - NEVER corrupt state
@@ -838,7 +879,7 @@ mod fuzz {
                         .parse()
                         .unwrap(),
                     3600,
-                    U128::from(1_000_000_000_000_000_000_000_000u128),
+                    U128::from(2_000_000_000_000_000_000_000_000u128),
                     Some(10),
                     Some(60),
                 );
@@ -857,7 +898,7 @@ mod fuzz {
     // Hostile agent_call amounts: zero, max u128, overflow pairs, odd values
     #[test]
     fn fuzz_hostile_amounts() {
-        let c = ctx(1_000_000_000_000_000_000_000_000);
+        let c = ctx(3_000_000_000_000_000_000_000_000);
         testing_env!(c.build());
         let mut contract = Contract::new(accounts(2));
         let _ = contract.create_wallet(
@@ -866,7 +907,7 @@ mod fuzz {
                 .parse()
                 .unwrap(),
             3600,
-            U128::from(1_000_000_000_000_000_000_000_000u128),
+            U128::from(2_000_000_000_000_000_000_000_000u128),
             Some(10),
             Some(60),
         );
@@ -904,7 +945,7 @@ mod fuzz {
     }
 
     #[test]
-    #[should_panic(expected = "min 1 NEAR funding")]
+    #[should_panic(expected = "min 2 NEAR funding")]
     fn underfunded_wallet_rejected() {
         testing_env!(ctx(50_000_000_000_000_000_000_000).build());
         let mut c = Contract::new(accounts(2));
@@ -914,7 +955,7 @@ mod fuzz {
                 .parse()
                 .unwrap(),
             3600,
-            U128::from(1_000_000_000_000_000_000_000_000u128),
+            U128::from(2_000_000_000_000_000_000_000_000u128),
             None,
             None,
         );
