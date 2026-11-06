@@ -326,10 +326,15 @@ impl Contract {
         t.spent = new_spent;
         self.tasks.insert(task_id.clone(), t);
 
-        env::log_str(&format!(
-            "{{\"event\":\"agent_payment\",\"task_id\":\"{}\",\"receiver\":\"{}\",\"amount\":\"{}\",\"spent\":\"{}\",\"memo\":\"{}\"}}",
-            task_id, receiver_id, amount, new_spent, memo
-        ));
+        let event = near_sdk::serde_json::json!({
+            "event": "agent_payment",
+            "task_id": task_id,
+            "receiver": receiver_id.to_string(),
+            "amount": amount.to_string(),
+            "spent": new_spent.to_string(),
+            "memo": memo
+        });
+        env::log_str(&event.to_string());
 
         // Funds leave the TASK SUB-ACCOUNT, not the factory: the factory
         // instructs the wallet's executor to pay from the wallet's own

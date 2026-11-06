@@ -116,6 +116,14 @@ create tasks. In production, use unpredictable task IDs
 (marked completed: true). For high-volume deployments,
 consider periodic cleanup or a separate registry contract.
 
+**Storage griefing:** Anyone can create tasks.
+High-volume task creation inflates factory storage.
+Mitigate with unpredictable task IDs and off-chain rate limiting.
+
+**Sweep recovery:** If the sweep promise fails after
+force_expire, the task is marked completed but funds
+may remain in the wallet. No retry path exists currently.
+
 ## Mainnet Deployment Checklist
 
 Before deploying to mainnet:

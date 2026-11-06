@@ -16,6 +16,10 @@ import { KeyPair, connect } from "near-api-js";
 export interface FukillaConfig {
   /** Factory contract account (e.g. "fukilla.testnet") */
   factory: string;
+  /** Account id that signs create_wallet — the contract records this as the
+   *  task owner (complete_task / force_expire / lift_quarantine authority).
+   *  Defaults to the factory account when omitted. */
+  ownerAccountId?: string;
   /** "testnet" | "mainnet" */
   network?: string;
   /** near-api-js connection (advanced) */
@@ -96,8 +100,8 @@ export class Fukilla {
       taskId,
       wallet: `${taskId}.${this.cfg.factory}`,
       // The on-chain owner is the account that signed create_wallet
-      // (the factory/caller account) — NOT a locally generated keypair.
-      ownerAccountId: this.cfg.factory,
+      // (the configured ownerAccountId, NOT a locally generated keypair).
+      ownerAccountId: this.cfg.ownerAccountId ?? this.cfg.factory,
       agentSecret: agentKp.toString(),
       agentPublicKey: agentKp.getPublicKey().toString(),
     };
