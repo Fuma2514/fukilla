@@ -51,7 +51,56 @@ We publish these because a security project that claims to be flawless is the le
 3. **Minimum funding was too low (found live).** A 0.05 NEAR funding failed on-chain: deploying the executor WASM + storage staking costs a measured **0.845 NEAR**, and with only 1 NEAR the wallet's liquid balance after staking was too thin for the agent's gas. **Fix (commits `9996a16`, `13a067d`):** minimum funding raised to **2 NEAR**, proven by the sandbox integration test.
 4. **Debugging lesson:** a `env::account_balance()` comparison inside the executor caused a silent wasm trap (panic=abort swallows messages); it was removed — the runtime already fails a transfer exceeding the wallet's balance, and the factory's spend cap bounds total outflow.
 
+## Quickstart
+
+### Prerequisites
+- Rust + cargo (stable)
+- NEAR CLI
+
+### Run tests
+```bash
+cargo test -- --nocapture
+```
+
+### Run clippy
+```bash
+cargo clippy -- -D warnings
+```
+
+### Deploy to testnet
+```bash
+cargo near build && near deploy fukilla.testnet target/wasm32-unknown-unknown/release/ephemeral_wallets.wasm
+```
+
+### Run attack simulation
+```bash
+cd demo && python3 attack_sim.py
+```
+
 ## Built at NEAR HACKATHON (security track), November 2026
+
+## FUKILLA vs existing solutions
+
+| | OutLayer | AgentLock | FUKILLA |
+|---|---|---|---|
+| Enforcement | Off-chain server | Off-chain event | On-chain contract |
+| Works if server down | ❌ | ❌ | ✅ |
+| Self-quarantine | ❌ | ❌ | ✅ |
+| Honeypot/canary | ❌ | ❌ | ✅ |
+| No backend needed | ❌ | ❌ | ✅ |
+| Open source | — | — | ✅ |
+
+## Track eligibility
+
+- Track 06 AI Security & Defense: sandboxed agent wallet, spend limits, function-call keys, self-quarantine
+- Track 05 AI Swarms: per-agent isolated wallet, multi-agent coordination safe
+- Track 07 Agent Economy: agent wallet infrastructure, spend cap per task
+
+## Ecosystem impact
+
+Any NEAR project giving AI agents money can drop in FUKILLA today: one contract call to `create_wallet`, one function-call key to the agent. No backend. No oracle. No new token. Pure NEAR primitives.
+
+This is infrastructure, not an app. Every AI agent wallet on NEAR is a potential user.
 
 ## Build & test
 
