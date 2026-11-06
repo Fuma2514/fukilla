@@ -2,6 +2,8 @@
 
 **"Burn after paying."**
 
+*"Burn after paying" — the wallet self-destructs after the task ends; all remaining funds return to the owner. Nothing is lost.*
+
 FUKILLA is a security-first wallet factory on NEAR Protocol that gives AI agents money **without giving them the keys**.
 
 Every AI agent that touches crypto has the same fatal design flaw: it holds a full private key to your funds. One leaked key, one prompt injection, one hallucination — everything gone. FUKILLA flips the model:
@@ -76,6 +78,52 @@ cargo near build && near deploy fukilla.testnet target/wasm32-unknown-unknown/re
 ```bash
 cd demo && python3 attack_sim.py
 ```
+
+> ⚠️ **Important:** `max_calls_per_window` defaults to 0 (disabled).
+> Always set this explicitly when creating a task wallet.
+> Example: `max_calls_per_window: 10, velocity_window_sec: 60`
+> A wallet created without this parameter has no velocity protection.
+
+## Setting Up the Canary (Honeypot)
+
+The canary is a known-malicious address. If the agent ever
+pays it, the wallet locks itself permanently and sweeps
+funds back to the owner.
+
+How to set it:
+1. Deploy the factory with a known scam/attacker address as canary
+2. Or update canary after deploy (owner only, via `set_canary`)
+3. If canary is not set, this layer is inactive —
+   velocity + spend cap still protect the wallet
+
+Recommended: set canary to any address from known phishing
+lists in your threat model.
+
+## Known Limitations
+
+**Task ID squatting:** Any account can call create_wallet
+and claim any task_id. There is no allowlist for who may
+create tasks. In production, use unpredictable task IDs
+(e.g. UUID or hash-based) to prevent front-running.
+
+**Registry growth:** Completed tasks remain in storage
+(marked completed: true). For high-volume deployments,
+consider periodic cleanup or a separate registry contract.
+
+## Mainnet Deployment Checklist
+
+Before deploying to mainnet:
+
+- [ ] Delete the full access key from factory account
+      after deploy (`near delete-key`)
+- [ ] Verify 0 full access keys remain on factory
+- [ ] Set canary address from your threat model
+- [ ] Test create_wallet + agent_call + force_expire
+      end-to-end on testnet first
+- [ ] Keep min 2 NEAR balance on factory for storage
+
+> After deleting the full access key, the contract
+> is immutable. No upgrade path exists by design.
 
 ## Built at NEAR HACKATHON (security track), November 2026
 
