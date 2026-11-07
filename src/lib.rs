@@ -42,8 +42,12 @@ pub struct Task {
     pub spend_cap: u128,
     /// Cumulative amount spent so far (yoctoNEAR)
     pub spent: u128,
-    /// True once the wallet has been swept and destroyed
+    /// True once the sweep has been confirmed by the on_swept callback
     pub completed: bool,
+    /// True between the sweep promise being issued and on_swept resolving:
+    /// blocks re-finalization and further spending while the sweep is in
+    /// flight, and is cleared again if the sweep fails (retry possible).
+    pub sweeping: bool,
     // ---- SENTINEL layers (agent-level defense, on-chain) ----
     /// Max payments allowed inside the velocity window (0 = disabled)
     pub max_calls_per_window: u32,
@@ -67,6 +71,13 @@ const EXECUTOR_WASM: &[u8] = include_bytes!("../executor.wasm");
 /// (up to ~100 Tgas at a 1e9 yoctoNEAR/gas price = 0.1 NEAR). The real
 /// spend limit is enforced in contract state (spend_cap), never by this.
 const GAS_ALLOWANCE_MARGIN: u128 = 500_000_000_000_000_000_000_000_000; // 0.5 NEAR gas headroom
+
+/// Storage deposit (burn) required per task id. Each task permanently
+/// registers a `Task` entry in the factory's `LookupMap` (completed tasks are
+/// kept as on-chain evidence), so `create_wallet` must attach this cost on
+/// top of the wallet funding. The factory retains it — unbounded free task
+/// creation (storage griefing) becomes economically infeasible.
+const TASK_STORAGE_COST: u128 = 10_000_000_000_000_000_000_000; // 0.01 NEAR
 // NOTE: NEAR allowance covers gas burnt by txs signed with this key AND
 // deposits. Sandbox/testnet gas price is dynamic, so a fixed margin must
 // cover the worst realistic case (~300 Tgas x 1e10 = 3 NEAR). The true
@@ -155,6 +166,16 @@ impl Contract {
             .expect("invalid task id");
         require!(!self.tasks.contains_key(&task_id), "task id already used");
 
+        // ---- Storage-griefing defense ---- the registry entry for this task
+        // is permanent, so the creator must cover its storage cost on top of
+        // the wallet funding. Anything above the cost goes to the wallet; the
+        // cost itself stays in the factory (a burn per task id).
+        require!(
+            funding.as_yoctonear() >= 2_000_000_000_000_000_000_000_000 + TASK_STORAGE_COST,
+            "funding must include the 0.01 NEAR task storage cost (min 2.01 NEAR)"
+        );
+        let wallet_funding = funding.as_yoctonear() - TASK_STORAGE_COST;
+
         let expiry_ts = env::block_timestamp() + ttl_sec * 1_000_000_000;
         let owner = env::predecessor_account_id();
 
@@ -168,6 +189,7 @@ impl Contract {
                 spend_cap: cap,
                 spent: 0,
                 completed: false,
+                sweeping: false,
                 max_calls_per_window: max_calls_per_window.unwrap_or(0),
                 velocity_window_ns: velocity_window_sec.unwrap_or(0) * 1_000_000_000,
                 call_times: Vec::new(),
@@ -178,7 +200,7 @@ impl Contract {
 
         let promise = Promise::new(wallet.clone())
             .create_account()
-            .transfer(funding)
+            .transfer(NearToken::from_yoctonear(wallet_funding))
             .deploy_contract(EXECUTOR_WASM.to_vec())
             .add_access_key_allowance(
                 agent_key,
@@ -266,6 +288,7 @@ impl Contract {
             "this key does not own this task wallet"
         );
         require!(!task.completed, "wallet already destroyed");
+        require!(!task.sweeping, "wallet is being swept");
         // ---- LAYER: quarantine gate ---- a quarantined wallet accepts nothing.
         require!(!task.quarantined, "wallet quarantined: behavior flagged");
         require!(
@@ -400,16 +423,25 @@ impl Contract {
     fn get_live_task(&self, task_id: &String) -> Task {
         let task = self.tasks.get(task_id).cloned().expect("unknown task");
         require!(!task.completed, "wallet already destroyed");
+        require!(
+            !task.sweeping,
+            "sweep already in progress; wait for it to resolve (or fail) before retrying"
+        );
         task
     }
 
+    /// Initiate the self-destruct sweep. The task is NOT marked completed
+    /// here — only `sweeping` — because the sweep promise can still fail
+    /// (e.g. executor error after force_expire/complete_task). The `on_swept`
+    /// callback confirms completion or clears `sweeping` so the sweep can be
+    /// retried via `complete_task` / `force_expire` without stranding funds.
     fn finalize(&mut self, task_id: String, task: Task) -> Promise {
         let mut t = task.clone();
-        t.completed = true;
+        t.sweeping = true;
         self.tasks.insert(task_id.clone(), t);
 
         env::log_str(&format!(
-            "{{\"event\":\"wallet_destroyed\",\"task_id\":\"{}\",\"wallet\":\"{}\",\"swept_to\":\"{}\"}}",
+            "{{\"event\":\"sweep_initiated\",\"task_id\":\"{}\",\"wallet\":\"{}\",\"swept_to\":\"{}\"}}",
             task_id, task.wallet, task.owner
         ));
 
@@ -426,6 +458,33 @@ impl Contract {
             NearToken::from_yoctonear(0),
             near_sdk::Gas::from_tgas(20),
         )
+        .then(Self::ext(env::current_account_id()).on_swept(task_id.clone()))
+    }
+
+    /// Callback: sweep-promise chain finished. On success the task is finally
+    /// marked `completed`. On failure `sweeping` is cleared so the owner (or
+    /// anyone, via force_expire) can retry the sweep — funds never strand in
+    /// a still-alive wallet due to a single failed sweep.
+    #[private]
+    pub fn on_swept(&mut self, task_id: String) {
+        let mut task = self.tasks.get(&task_id).cloned().expect("unknown task");
+        let ok = env::promise_result_checked(0, usize::MAX).is_ok();
+        if ok {
+            task.completed = true;
+            task.sweeping = false;
+            self.tasks.insert(task_id.clone(), task);
+            env::log_str(&format!(
+                "{{\"event\":\"wallet_destroyed\",\"task_id\":\"{}\"}}",
+                task_id
+            ));
+        } else {
+            task.sweeping = false;
+            self.tasks.insert(task_id.clone(), task);
+            env::log_str(&format!(
+                "{{\"event\":\"sweep_failed_retryable\",\"task_id\":\"{}\"}}",
+                task_id
+            ));
+        }
     }
 
     // ---------- views ----------
@@ -469,9 +528,12 @@ mod tests {
             .unwrap()
     }
 
+    /// 2 NEAR wallet funding + 0.01 NEAR task storage cost
+    const CREATE_DEPOSIT: u128 = 2_010_000_000_000_000_000_000_000;
+
     fn create(contract: &mut Contract) {
         let mut ctx = context();
-        ctx.attached_deposit(NearToken::from_near(2));
+        ctx.attached_deposit(NearToken::from_yoctonear(CREATE_DEPOSIT));
         testing_env!(ctx.build());
         let _ = contract.create_wallet(
             TASK_ID.to_string(),
@@ -503,7 +565,7 @@ mod tests {
         let mut c = Contract::new(accounts(2));
         create(&mut c);
         let mut ctx = context();
-        ctx.attached_deposit(NearToken::from_near(2));
+        ctx.attached_deposit(NearToken::from_yoctonear(CREATE_DEPOSIT));
         testing_env!(ctx.build());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = c.create_wallet(TASK_ID.to_string(), pk(), 3600, U128::from(1), None, None);
@@ -598,6 +660,30 @@ mod tests {
         );
     }
 
+    /// Helper: simulate the sweep promise resolving (or failing) in the
+    /// on_swept callback, using the mock's promise-result injection.
+    fn sweep_resolves() {
+        let ctx = context();
+        testing_env!(
+            ctx.build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![near_sdk::PromiseResult::Successful(vec![])],
+        );
+    }
+
+    fn sweep_fails() {
+        let ctx = context();
+        testing_env!(
+            ctx.build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![near_sdk::PromiseResult::Failed],
+        );
+    }
+
     #[test]
     fn owner_can_complete_and_sweep() {
         let ctx = context();
@@ -610,6 +696,12 @@ mod tests {
         ctx.predecessor_account_id(owner);
         testing_env!(ctx.build());
         let _ = c.complete_task(TASK_ID.to_string());
+        // sweeping until the on_swept callback confirms
+        let t = c.get_task(TASK_ID.to_string()).unwrap();
+        assert!(t.sweeping);
+        assert!(!t.completed);
+        sweep_resolves();
+        c.on_swept(TASK_ID.to_string());
         assert!(c.get_task(TASK_ID.to_string()).unwrap().completed);
     }
 
@@ -625,6 +717,9 @@ mod tests {
         ctx.predecessor_account_id(accounts(5));
         testing_env!(ctx.build());
         let _ = c.force_expire(TASK_ID.to_string());
+        assert!(c.get_task(TASK_ID.to_string()).unwrap().sweeping);
+        sweep_resolves();
+        c.on_swept(TASK_ID.to_string());
         assert!(c.get_task(TASK_ID.to_string()).unwrap().completed);
     }
 
@@ -680,7 +775,7 @@ mod tests {
     fn sentinel_wallet(c: &mut Contract) {
         // wallet with velocity limit 2 calls / 60s
         let mut ctx = context();
-        ctx.attached_deposit(NearToken::from_near(2));
+        ctx.attached_deposit(NearToken::from_yoctonear(CREATE_DEPOSIT));
         testing_env!(ctx.build());
         let _ = c.create_wallet(
             "sentinel-task".to_string(),
@@ -782,7 +877,7 @@ mod tests {
         );
         let t = c.get_task("sentinel-task".to_string()).unwrap();
         assert!(t.quarantined);
-        assert!(t.completed);
+        assert!(t.sweeping);
     }
 
     #[test]
@@ -856,6 +951,129 @@ mod tests {
             Some(30),
             Some(400 * 24 * 3600),
         );
+    }
+    // ---------- storage-griefing regression tests ----------
+
+    /// A deposit that covers wallet funding but not the per-task storage cost
+    /// must be rejected: otherwise anyone could inflate the factory's
+    /// permanent task registry for free.
+    #[test]
+    #[should_panic(expected = "task storage cost")]
+    fn create_wallet_without_storage_cost_fails() {
+        let mut ctx = context();
+        // exactly the old 2 NEAR minimum — no storage cost attached
+        ctx.attached_deposit(NearToken::from_near(2));
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        let _ = c.create_wallet(
+            TASK_ID.to_string(),
+            pk(),
+            3600,
+            U128::from(2_000_000_000_000_000_000_000_000u128),
+            None,
+            None,
+        );
+    }
+
+    /// The storage cost is retained by the factory (burned) while the rest
+    /// funds the wallet; the task is recorded normally.
+    #[test]
+    fn storage_cost_burned_on_creation() {
+        let mut ctx = context();
+        ctx.attached_deposit(NearToken::from_yoctonear(CREATE_DEPOSIT));
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        let _ = c.create_wallet(
+            TASK_ID.to_string(),
+            pk(),
+            3600,
+            U128::from(2_000_000_000_000_000_000_000_000u128),
+            None,
+            None,
+        );
+        // the wallet receives funding minus the 0.01 NEAR storage burn
+        let t = c.get_task(TASK_ID.to_string()).unwrap();
+        assert_eq!(t.funding, CREATE_DEPOSIT);
+        assert!(!t.completed);
+    }
+
+    // ---------- sweep-recovery regression tests ----------
+
+    /// A failed sweep must NOT strand funds: on_swept clears `sweeping`,
+    /// the task stays retryable (completed=false), and a second
+    /// complete/force_expire re-initiates the sweep. This is the fix for the
+    /// "finalize marks completed before the sweep resolves" finding.
+    #[test]
+    fn sweep_failure_is_retryable() {
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        create(&mut c);
+        // owner completes: sweep initiated, not yet completed
+        let owner = c.get_task(TASK_ID.to_string()).unwrap().owner;
+        let mut ctx = context();
+        ctx.signer_account_id(owner.clone());
+        ctx.predecessor_account_id(owner.clone());
+        testing_env!(ctx.build());
+        let _ = c.complete_task(TASK_ID.to_string());
+        let t = c.get_task(TASK_ID.to_string()).unwrap();
+        assert!(t.sweeping && !t.completed);
+
+        // sweep promise FAILS -> sweeping cleared, task retryable
+        sweep_fails();
+        c.on_swept(TASK_ID.to_string());
+        let t = c.get_task(TASK_ID.to_string()).unwrap();
+        assert!(!t.sweeping);
+        assert!(!t.completed, "a failed sweep must not mark the task completed");
+
+        // retry via force_expire (time has advanced past expiry in this ctx)
+        let mut ctx = context();
+        ctx.signer_account_id(owner.clone());
+        ctx.predecessor_account_id(owner);
+        ctx.block_timestamp(3600 * 1_000_000_000 + 1);
+        testing_env!(ctx.build());
+        let _ = c.force_expire(TASK_ID.to_string());
+        assert!(c.get_task(TASK_ID.to_string()).unwrap().sweeping);
+
+        // this time the sweep resolves -> completed
+        sweep_resolves();
+        c.on_swept(TASK_ID.to_string());
+        assert!(c.get_task(TASK_ID.to_string()).unwrap().completed);
+    }
+
+    /// While a sweep is in flight a second finalize must be rejected (no
+    /// double sweep) and the agent must not be able to spend.
+    #[test]
+    fn sweeping_wallet_rejects_finalize_and_spending() {
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        create(&mut c);
+        let owner = c.get_task(TASK_ID.to_string()).unwrap().owner;
+        let mut ctx = context();
+        ctx.signer_account_id(owner.clone());
+        ctx.predecessor_account_id(owner.clone());
+        testing_env!(ctx.build());
+        let _ = c.complete_task(TASK_ID.to_string());
+
+        // second finalize while sweeping panics
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = c.complete_task(TASK_ID.to_string());
+        }));
+        assert!(result.is_err(), "double finalize while sweeping must panic");
+
+        // the agent key cannot spend while the sweep is in flight
+        let wallet = c.get_task(TASK_ID.to_string()).unwrap().wallet;
+        wallet_ctx(&wallet, 0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = c.agent_call(
+                TASK_ID.to_string(),
+                "api-provider.near".parse().unwrap(),
+                U128::from(1),
+                "during-sweep".to_string(),
+            );
+        }));
+        assert!(result.is_err(), "spending during sweep must panic");
     }
 }
 

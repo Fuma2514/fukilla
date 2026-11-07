@@ -45,7 +45,7 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
             }),
         )
         .transaction()
-        .deposit(NearToken::from_near(2))
+        .deposit(NearToken::from_yoctonear(2_010_000_000_000_000_000_000_000u128)) // 2 NEAR funding + 0.01 NEAR task storage cost
         .gas(NearGas::from_tgas(100))
         .with_signer(owner.account_id().clone(), signer.clone())
         .send_to(&sandbox_network)

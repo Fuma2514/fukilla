@@ -34,10 +34,25 @@ what it deliberately does not defend against, and the audit trail.
   the orchestration layer).
 - Consensus-level attacks (NEAR validator misbehavior).
 
-## OPEN findings (status: OPEN — not fixed, not tested; keep open until fixed AND covered by a passing test)
+## Findings (status)
 
-- **Storage griefing (OPEN)**: Anyone can call `create_wallet`. High-volume task creation inflates factory storage (each task registers a `Task` in the factory `LookupMap`). Mitigations not implemented: no rate limit, no fee/burn, no owner allowlist. A fix (e.g. owner-signed creation or storage-cost burn per task id) plus a regression test is required before this can be closed.
-- **Sweep recovery (OPEN)**: `finalize()` marks the task `completed = true` before the `sweep` promise resolves, and there is no callback/retry. If the sweep fails after `force_expire`/`complete_task`, funds may remain stranded in the (still-alive) wallet account. A retry path or post-sweep verification callback plus a test is required before closure.
+- **Storage griefing (FIXED)**: `create_wallet` now requires the attached
+  deposit to cover a 0.01 NEAR per-task-id storage cost (`TASK_STORAGE_COST`)
+  **on top of** the 2 NEAR wallet funding minimum (min 2.01 NEAR). The cost is
+  retained by the factory (burn) to pay for the permanent registry entry;
+  unbounded free task creation is no longer possible. Tests:
+  `create_wallet_without_storage_cost_fails` (negative), `storage_cost_burned_on_creation`
+  (positive) — src/lib.rs `#[cfg(test)] mod tests`.
+- **Sweep recovery (FIXED)**: `finalize()` no longer marks the task
+  `completed` synchronously. It sets `sweeping = true` and chains an
+  `on_swept` callback: on promise success the task becomes `completed`; on
+  failure `sweeping` is cleared and the sweep can be retried via
+  `complete_task` / `force_expire` — funds cannot strand in a still-alive
+  wallet from a single failed sweep. While `sweeping`, re-finalization and
+  `agent_call` are rejected. Tests: `sweep_failure_is_retryable`,
+  `sweeping_wallet_rejects_finalize_and_spending`, plus updated
+  `owner_can_complete_and_sweep` / `anyone_can_force_expire_after_window` /
+  `canary_payment_sweeps_and_locks` — src/lib.rs `#[cfg(test)] mod tests`.
 - **WASM reproducibility (OPEN, auditor)**: the on-chain code hash `53yp7kAJf3rsGeD54ZKS1VeQ4C7WwR9HZ1Jtw4393eC9` matches NONE of the attempted build routes (plain pinned cargo at b2990fb/e9642fb → `51YNFS3zsoMa6LhaL6s2PWh32LADbSEQ12qHU6nJd3sD`; cargo-near 0.22.0 → `cb555ca2…`; pinned Docker reproducible image → `A2hxs4HXmDuJEGHsNnWx5p9dqtVJz6foMnGxKRovWR8W`), and plain builds are path-dependent. Deployed-code-to-source attribution is UNVERIFIED — a finding until reproduced byte-for-byte.
 
 ## Audit trail
@@ -48,6 +63,7 @@ what it deliberately does not defend against, and the audit trail.
 | 2026-11-06 | Sentinel red-team (S1–S15) | 13 pass; 2 findings (velocity param caps) fixed same day; +2 negative tests |
 | 2026-11-06 | Reproducible builds | `cargo build --target wasm32-unknown-unknown --release`; tests 16 unit + 1 integration PASS |
 | 2026-11-07 | External auditor verification (rustc 1.93.0, `cargo test -j 1` at HEAD e9642fb) | 21 unit + 1 sandbox integration PASS; +5 SDK signer tests PASS (finding A fix in e9642fb verified). `verify_deployment.sh` added (builds b2990fb + e9642fb, hashes vs on-chain code_hash). Storage-griefing & sweep-recovery remain OPEN |
+| 2026-11-07 | Storage-griefing & sweep-recovery fixes | `create_wallet` requires 0.01 NEAR per-task storage burn (min 2.01 NEAR); `finalize` sets `sweeping` + `on_swept` callback with retry on failure. 25 unit + 1 sandbox integration PASS (`cargo test -j 1`); `cargo clippy --tests` 0 warnings. Both findings FIXED; WASM reproducibility still OPEN |
 
 Commits: `f069a04` (audit fixes) → `7986d5d` (SENTINEL) → `7a45097` (sentinel hardening).
 
