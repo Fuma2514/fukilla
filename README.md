@@ -240,6 +240,15 @@ Integration notes for builders:
 - Funding must be **≥ 2 NEAR** (measured storage cost on testnet: 0.845 NEAR).
 - The agent key is function-call-only: `0 full access keys and 1 function-call-only access key` (verified via `near account view-account-summary`).
 
+---
+
+## NEAR HACKATHON 2026 submission
+
+- **Event:** NEAR HACKATHON (2026-11-01 → 2026-11-14, https://nearhackathon.com)
+- **Track:** `security` — AI-controlled money made safer (spend caps, sandboxed per-task wallets, function-call keys)
+- **Status at this repo:** all code below HEAD is written inside the hackathon window; earlier commits (`b2990fb`, `100f29b`) are the pre-hackathon baseline.
+- **Judge quickstart:** clone → `cargo test -j 1` (25 unit tests + 1 near-sandbox integration test) → `./verify_deployment.sh` reproduces the audit evidence against testnet `fukilla.testnet`. Demo tooling in `demo/`; integration guide in `SUBMISSION.md`.
+
 ## License
 
 MIT
