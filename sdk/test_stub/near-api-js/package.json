@@ -1,0 +1,7 @@
+{
+  "name": "near-api-js-stub",
+  "version": "0.0.0",
+  "description": "Local test stub for near-api-js used by sdk unit tests (no network).",
+  "main": "index.js",
+  "type": "commonjs"
+}
