@@ -34,6 +34,14 @@ Facts independently re-verified (external auditor, 2026-11-07) against live on-c
 - Tests run with `cargo test -j 1` on the pinned toolchain
 - Deployment verification: `./verify_deployment.sh` — builds the contract at BOTH audit commits (`b2990fb` and HEAD `e9642fb`) in detached git worktrees with the pinned toolchain, hashes each WASM (SHA-256 hex + Base58), queries the on-chain `code_hash` via RPC, reports which commit matches, and **exits non-zero if neither matches**. It prints the full evidence summary (source commit, rustc version, cargo-near version, build command, both hashes, RPC endpoint, raw RPC response). Run it in this repo root to reproduce.
 
+## Release candidate (2026-11-12, commit `d464e6d` on `fix/demo-portability`)
+
+- Build: `git worktree add --detach /tmp/wt_rc d464e6d && cd /tmp/wt_rc && cargo near build non-reproducible-wasm --locked` (cargo-near 0.22.0, rustc 1.93.0 pinned)
+- WASM: **318,120 B**, SHA-256 **`60db5a34be7b97328607e26871fc43579c59a5a1e3e520e3c2f4ce873627ca6a`**, Base58 **`7X68rFeSMDFgVg4NrbkF9KTcpKKse8jxHPiFHkk5Dohb`**
+- **Determinism verified**: two independent builds in different worktree paths produced the identical hash.
+- Tests at `d464e6d`: unit **25/25**, sandbox **1/1**, SDK signer **5/5** (testnet integration: 1 SKIP by design — no credentials in CI).
+- Not yet deployed. The live `fukilla.testnet` still runs the historical bytecode above until an approved redeploy; after redeploy, `Base58(SHA-256(build))` must equal the new on-chain `code_hash` before this commit may be called "live".
+
 ## On-chain (testnet, verified via https://rpc.testnet.near.org)
 
 - Factory account: `fukilla.testnet` (signer & receiver of deploy tx `GEwkF97Q1gdu6jHRu7hZCNpAsXhqAqunwZD69YtSbs2w`, action `DeployContract`, status `SuccessValue` — verified by fetching the tx via RPC)
