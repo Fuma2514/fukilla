@@ -584,6 +584,116 @@ mod tests {
     }
 
     #[test]
+    fn velocity_identical_timestamps_still_burst() {
+        // All attempts share the SAME block timestamp (same block): the
+        // recency filter (now - ts < window) must still count them, so the
+        // burst trips the breaker instead of resetting the window.
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        sentinel_wallet(&mut c);
+        let wallet = c.get_task(stid()).unwrap().wallet;
+        for i in 0..2u64 {
+            wallet_ctx(&wallet, 0); // identical timestamp every time
+            let _ = c.agent_call(
+                stid(),
+                "api-provider.near".parse().unwrap(),
+                U128::from(100_000_000_000_000_000_000_000u128),
+                format!("same-{i}"),
+            );
+        }
+        wallet_ctx(&wallet, 0);
+        let _ = c.agent_call(
+            stid(),
+            "api-provider.near".parse().unwrap(),
+            U128::from(100_000_000_000_000_000_000_000u128),
+            "same-burst".to_string(),
+        );
+        assert!(
+            c.get_task(stid()).unwrap().quarantined,
+            "identical-timestamp burst must trip the breaker"
+        );
+    }
+
+    #[test]
+    fn lift_quarantine_restores_spending() {
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        sentinel_wallet(&mut c);
+        let wallet = c.get_task(stid()).unwrap().wallet;
+        // force a quarantine
+        for i in 0..3u64 {
+            wallet_ctx(&wallet, i);
+            let _ = c.agent_call(
+                stid(),
+                "api-provider.near".parse().unwrap(),
+                U128::from(100_000_000_000_000_000_000_000u128),
+                format!("q-{i}"),
+            );
+        }
+        assert!(c.get_task(stid()).unwrap().quarantined);
+        // owner lifts the quarantine
+        testing_env!(context().build());
+        c.lift_quarantine(stid());
+        let t = c.get_task(stid()).unwrap();
+        assert!(!t.quarantined);
+        assert!(t.call_times.is_empty(), "window must be cleared on lift");
+        // spending works again (fresh window)
+        wallet_ctx(&wallet, 1_000_000_000);
+        let _ = c.agent_call(
+            stid(),
+            "api-provider.near".parse().unwrap(),
+            U128::from(100_000_000_000_000_000_000_000u128),
+            "after-lift".to_string(),
+        );
+        assert!(c.get_task(stid()).unwrap().spent >= 100_000_000_000_000_000_000_000u128);
+    }
+
+    #[test]
+    fn completed_task_rejects_force_expire() {
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        create(&mut c);
+        // owner completes (sweep simulated resolved)
+        testing_env!(context().build());
+        let _ = c.complete_task(task_id());
+        sweep_resolves();
+        c.on_swept(task_id());
+        // racing force_expire on the same task must fail (no double finalize)
+        let mut ctx = context();
+        ctx.signer_account_id(accounts(4));
+        ctx.predecessor_account_id(accounts(4));
+        ctx.block_timestamp(999 * 1_000_000_000);
+        testing_env!(ctx.build());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = c.force_expire(task_id());
+        }));
+        assert!(result.is_err(), "completed task must refuse force_expire");
+    }
+
+    #[test]
+    fn revoked_wallet_still_recoverable_by_owner() {
+        // revoke_key is incident response, not a dead end: after revocation
+        // the owner must still be able to complete the task and sweep funds.
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        create(&mut c);
+        testing_env!(context().build());
+        let _ = c.revoke_key(task_id());
+        // owner still closes the task
+        testing_env!(context().build());
+        let _ = c.complete_task(task_id());
+        sweep_resolves();
+        c.on_swept(task_id());
+        let t = c.get_task(task_id()).unwrap();
+        assert!(t.completed, "task must complete after revoke_key");
+        assert!(!t.sweeping, "sweep flag cleared by on_swept");
+    }
+
+    #[test]
     fn create_wallet_records_task() {
 
         let ctx = context();
