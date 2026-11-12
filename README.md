@@ -38,9 +38,11 @@ Facts independently re-verified (external auditor, 2026-11-07) against live on-c
 
 - Factory account: `fukilla.testnet` (signer & receiver of deploy tx `GEwkF97Q1gdu6jHRu7hZCNpAsXhqAqunwZD69YtSbs2w`, action `DeployContract`, status `SuccessValue` — verified by fetching the tx via RPC)
 - On-chain `code_hash` of `fukilla.testnet` (queried at audit time): `53yp7kAJf3rsGeD54ZKS1VeQ4C7WwR9HZ1Jtw4393eC9` (storage usage 312287 bytes)
+- **Latest deployment transaction: `6QTzdNN9TZERS2VbJAM4bdgobMPcLET1jCaxagq2qX6J`** (confirmed via archival RPC — the most recent `DeployContract` on `fukilla.testnet`). Earlier tx `GEwkF97Q1gdu6jHRu7hZCNpAsXhqAqunwZD69YtSbs2w` is a historical deployment, superseded.
 - Deployment hash verification (2026-11-07, `./verify_deployment.sh`): **MISMATCH — none of the local builds reproduce the on-chain code hash.** All three build routes produce distinct WASMs:
   - plain pinned `cargo build -j 1 --locked --release --target wasm32-unknown-unknown` at `b2990fb` and at `e9642fb` (factory code identical between them): SHA-256 `3b9236b90523da59e1549c2d9a5af89f30acc201c2a7dd7ae7fb2b60cecf5d38` = Base58 `51YNFS3zsoMa6LhaL6s2PWh32LADbSEQ12qHU6nJd3sD` (built in /tmp worktrees; the same commit built in the repo directory yields a DIFFERENT hash `63cc3db49abd634890e10caa2cb56830e43edf94fe8695258267ea1cec0b7bfb` — local plain builds are path-dependent)
   - `cargo near build non-reproducible-wasm --locked` (cargo-near 0.22.0, rustc 1.93.0): SHA-256 `cb555ca2d01b32d764cd2abdce0c9c3d6bc1a459340740c322cafc1b17318d07`
+  - **Re-verified 2026-11-12 (cargo-near 0.22.0, /tmp worktree at `b2990fb`):** SHA-256 `63cc3db49abd634890e10caa2cb56830e43edf94fe8695258267ea1cec0b7bfb`, size **311,168 B** — closest to the deployed WASM (311,400 B, delta = 232 bytes, first divergence at byte 2864, consistent with a shifted data-section offset). One commit earlier, `bf8f060` (cargo-near route): 304,496 B — excluded. `b2990fb`-era source is confirmed as the deploy-time route, but the exact source state remains **not reconstructible from git** (likely an uncommitted working tree at deploy time).
   - `cargo near build reproducible-wasm` with the pinned Docker image (`sourcescan/cargo-near:0.21.1-rust-1.96.0@sha256:ccb22bb4…`): SHA-256 `86291490cab62c8e08a1237e3f55d0d2b59481df5e0504a918e69e46d086aeab` = Base58 `A2hxs4HXmDuJEGHsNnWx5p9dqtVJz6foMnGxKRovWR8W`
   - On-chain: `53yp7kAJf3rsGeD54ZKS1VeQ4C7WwR9HZ1Jtw4393eC9`. **This is an open audit finding: the deployed contract cannot be reproduced byte-for-byte by any route attempted** (possible causes: different commit/toolchain at deploy time, or a non-pinned build; tx `GEwkF97Q1gdu6jHRu7hZCNpAsXhqAqunwZD69YtSbs2w` only carries ~37 bytes of code metadata, so the deployed source cannot be confirmed from the tx alone). Treat deployed-code-to-source attribution as UNVERIFIED.
 - Factory deploy + init txs: `82nihL6tcesZzRYwy8UCyCgWKCiF7mjwTVTobUXFETez` / `8w17hffEXS1GBvSi6dDYckF6VJMvxfyFMmGvKcRVeVmx`
@@ -49,7 +51,7 @@ Facts independently re-verified (external auditor, 2026-11-07) against live on-c
 
 ## Test results (2026-11-07, rustc 1.93.0, `cargo test -j 1` at HEAD `e9642fb`)
 
-- Unit tests (`src/lib.rs`): **21 passed, 0 failed**
+- Unit tests (`src/lib.rs`): **21 passed, 0 failed**; re-run 2026-11-12 at `1283c06`: **25 passed, 0 failed** (includes storage-cost burn, sweep-recovery `on_swept` callback, velocity pairing, and memo-injection hardening tests)
 - Sandbox integration test (`tests/test_basics.rs`, real `near-sandbox` chain + `cargo near` build): **1 passed, 0 failed**
 - SDK signer tests (`sdk/sdk_owner_signer.test.ts`, `node --experimental-strip-types --test`): **5 passed, 0 failed** — proves the SDK signs `create_wallet` AND `complete_task` with the configured `ownerAccountId` (e.g. `alice.owner.testnet`), not the factory account (GPT audit finding A, fixed in `e9642fb`, verified here by test).
 
