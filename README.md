@@ -105,7 +105,7 @@ Maximum economic exposure per wallet, derived from `src/lib.rs` and `executor/sr
 
 # DOCUMENTED LIMITATIONS (OPEN findings)
 
-**Task ID squatting** (OPEN): Any account can call create_wallet and claim any task_id. There is no allowlist for who may create tasks. In production, use unpredictable task IDs (e.g. UUID or hash-based) to prevent front-running.
+**Task ID squatting** (FIXED in HEAD): `create_wallet` now requires the task_id to start with the first 8 hex chars of SHA-256(owner) — a per-owner namespace enforced on-chain (`expected_task_prefix` view for SDKs/demos). Squatting another owner's ids is infeasible; front-running only works against an *exactly* published id. Residual: use unpredictable suffixes (e.g. UUID) for unannounced tasks.
 
 **Registry growth** (OPEN): Completed tasks remain in storage (marked completed: true). For high-volume deployments, consider periodic cleanup or a separate registry contract.
 

@@ -33,12 +33,24 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
     );
     let agent_pk = agent_keypair.public_key();
 
-    // Owner funds and creates the ephemeral wallet
+    // Owner funds and creates the ephemeral wallet.
+    // task_id must start with the owner's namespace prefix (squatting defense):
+    // first 8 hex chars of SHA-256(owner account id).
+    let owner_id_str = owner.account_id().as_str().to_string();
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(owner_id_str.as_bytes());
+        h.finalize()
+    };
+    let prefix: String = digest.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+        [..8].to_string();
+    let task_id = format!("{}task1", prefix);
     contract
         .call_function(
             "create_wallet",
             json!({
-                "task_id": "task-1",
+                "task_id": task_id,
                 "agent_key": agent_pk.to_string(),
                 "ttl_sec": 60,
                 "spend_cap": "5000000000000000000000000" // 0.005 NEAR cap
@@ -52,7 +64,7 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
         .await?
         .assert_success();
 
-    let wallet_id: AccountId = "task-1.factory.sandbox".parse()?;
+    let wallet_id: AccountId = format!("{}.factory.sandbox", task_id).parse()?;
 
     // Verify the task was recorded
     #[derive(near_sdk::serde::Deserialize)]
@@ -67,7 +79,7 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
         completed: bool,
     }
     let task: Task = contract
-        .call_function("get_task", json!({"task_id": "task-1"}))
+        .call_function("get_task", json!({"task_id": task_id}))
         .read_only()
         .fetch_from(&sandbox_network)
         .await?
@@ -81,7 +93,7 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
         .call_function(
             "agent_call",
             json!({
-                "task_id": "task-1",
+                "task_id": task_id,
                 "receiver_id": "api-provider.sandbox",
                 "amount": "1000000000000000000000000", // 0.001 NEAR
                 "memo": "LLM api call"
@@ -106,7 +118,7 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
         .assert_success();
 
     let remaining_bytes = contract
-        .call_function("remaining_spend", json!({"task_id": "task-1"}))
+        .call_function("remaining_spend", json!({"task_id": task_id}))
         .read_only_raw()
         .fetch_from(&sandbox_network)
         .await?
@@ -123,7 +135,7 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
         .call_function(
             "agent_call",
             json!({
-                "task_id": "task-1",
+                "task_id": task_id,
                 "receiver_id": "api-provider.sandbox",
                 "amount": "5000000000000000000000000",
                 "memo": "over cap"
@@ -147,7 +159,7 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
         .await?
         .total;
     contract
-        .call_function("complete_task", json!({"task_id": "task-1"}))
+        .call_function("complete_task", json!({"task_id": task_id}))
         .transaction()
         .gas(NearGas::from_tgas(100))
         .with_signer(owner.account_id().clone(), signer.clone())
