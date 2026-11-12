@@ -584,6 +584,81 @@ mod tests {
     }
 
     #[test]
+    fn wallet_creation_failure_refunds_owner_and_drops_task() {
+        // Simulate the create-wallet promise chain FAILING: the task must be
+        // forgotten and a refund transfer to the owner must be issued.
+        let owner = accounts(2);
+        let funding: u128 = 1_000_000_000_000_000_000_000_000;
+        let mut ctx = context();
+        ctx.attached_deposit(NearToken::from_yoctonear(funding));
+        testing_env!(ctx.build());
+        let mut c = Contract::new(owner.clone());
+        create(&mut c);
+        assert!(c.get_task(task_id()).is_some());
+        // callback runs with a FAILED promise result
+        testing_env!(
+            context().build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![near_sdk::PromiseResult::Failed],
+        );
+        c.on_wallet_created(task_id(), owner.clone(), U128::from(funding));
+        assert!(
+            c.get_task(task_id()).is_none(),
+            "failed creation must forget the task"
+        );
+    }
+
+    #[test]
+    fn dust_agent_payment_succeeds() {
+        // A 1-yoctoNEAR payment is legal (no minimum payment rule): cap
+        // arithmetic must hold at the absolute bottom of the range.
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        sentinel_wallet(&mut c);
+        let wallet = c.get_task(stid()).unwrap().wallet;
+        wallet_ctx(&wallet, 1_000_000_000);
+        let _ = c.agent_call(
+            stid(),
+            "api-provider.near".parse().unwrap(),
+            U128::from(1u128),
+            "dust".to_string(),
+        );
+        let t = c.get_task(stid()).unwrap();
+        assert_eq!(t.spent, 1u128, "dust payment must be recorded exactly");
+        assert!(t.spent <= t.spend_cap);
+    }
+
+    #[test]
+    fn dust_wallet_still_sweeps_and_completes() {
+        // A wallet funded at the 0.01 storage minimum (effectively no spend
+        // headroom) still follows the full lifecycle to completion.
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        let mut cctx = context();
+        cctx.attached_deposit(NearToken::from_yoctonear(CREATE_DEPOSIT));
+        testing_env!(cctx.build());
+        let _ = c.create_wallet(
+            task_id(),
+            pk(),
+            3600,
+            U128::from(1u128), // 1-yocto cap: dust headroom
+            None,
+            None,
+        );
+        testing_env!(context().build());
+        let _ = c.complete_task(task_id());
+        sweep_resolves();
+        c.on_swept(task_id());
+        let t = c.get_task(task_id()).unwrap();
+        assert!(t.completed, "dust wallet must complete its lifecycle");
+        assert!(!t.sweeping);
+    }
+
+    #[test]
     fn velocity_identical_timestamps_still_burst() {
         // All attempts share the SAME block timestamp (same block): the
         // recency filter (now - ts < window) must still count them, so the
