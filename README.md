@@ -119,7 +119,9 @@ Maximum economic exposure per wallet, derived from `src/lib.rs` and `executor/sr
 
 **Storage griefing** — **STATUS: OPEN (not fixed, not tested)**: Anyone can create tasks. High-volume task creation inflates factory storage. Mitigate with unpredictable task IDs and off-chain rate limiting. This finding remains open until a fix (e.g. owner-signed creation or fee/burn per task id) is implemented AND covered by a passing test.
 
-**Sweep recovery** — **STATUS: OPEN (not fixed, not tested)**: If the sweep promise fails after `force_expire`/`complete_task` (`finalize` marks `completed = true` before the `sweep` promise resolves, with no callback or retry), the task is marked completed but funds may remain in the wallet. No retry path exists currently. This finding remains open until a retry/monitoring path is implemented AND covered by a passing test.
+**Agent-key revocation** (FIXED in HEAD, `revoke_key`): the task owner can immediately delete the agent's function-call key from the wallet (`revoke_key(task_id)`, owner-gated). After revocation the agent cannot sign anything — spending stops at the protocol level, not just at the contract level. The task remains recoverable via `complete_task`/`force_expire` (sweep-back does not depend on the agent key). Covered by unit tests (`revoke_key_wrong_caller_panics`, `revoke_key_by_owner_emits_delete_key_promise`, `revoke_key_unknown_task_panics`).
+
+**Sweep recovery** — STATUS: FIXED (tested): `finalize` sets `sweeping = true` and the `on_swept` callback clears it; a failed sweep does NOT mark the task completed and stays retryable via `force_expire`. Regression test: "a failed sweep must not mark the task completed" (unit, green at HEAD).
 
 **WASM reproducibility** (OPEN): `verify_deployment.sh` compares locally built WASM hashes against the on-chain `code_hash`. If they differ (path/rustc nondeterminism, cargo-near Docker builds vs. plain builds), that is reported as an explicit MISMATCH with both hashes — treat the deployed code as unverified until reproduced byte-for-byte (see `Cargo.toml` `[package.metadata.near.reproducible_build]` for the Docker route).
 

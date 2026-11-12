@@ -410,6 +410,25 @@ impl Contract {
         self.tasks.insert(task_id, task);
     }
 
+    /// Incident response: the task owner immediately deletes the agent's
+    /// function-call key from the wallet. From the next block onward the
+    /// agent cannot sign ANY transaction — spending stops at the protocol
+    /// level, not just at the contract level. The task itself stays alive
+    /// and remains recoverable via complete_task / force_expire (sweep-back
+    /// does not depend on the agent key).
+    pub fn revoke_key(&mut self, task_id: String) -> Promise {
+        let task = self.get_live_task(&task_id);
+        require!(
+            env::predecessor_account_id() == task.owner,
+            "only the task owner can revoke the agent key"
+        );
+        env::log_str(&format!(
+            "{{\"event\":\"agent_key_revoked\",\"task_id\":\"{}\",\"wallet\":\"{}\"}}",
+            task_id, task.wallet
+        ));
+        Promise::new(task.wallet).delete_key(task.agent_key.clone())
+    }
+
     /// Owner closes the task: sweeps the remaining balance back to the owner
     /// and deletes the wallet account entirely. After this the agent's key
     /// is dead — its account no longer exists.
@@ -566,6 +585,7 @@ mod tests {
 
     #[test]
     fn create_wallet_records_task() {
+
         let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
@@ -588,6 +608,54 @@ mod tests {
         testing_env!(ctx.build());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = c.create_wallet(task_id(), pk(), 3600, U128::from(1), None, None);
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn revoke_key_wrong_caller_panics() {
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        create(&mut c);
+        // impersonator (accounts(3)) tries to revoke
+        let mut ctx = context();
+        ctx.signer_account_id(accounts(3));
+        ctx.predecessor_account_id(accounts(3));
+        testing_env!(ctx.build());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = c.revoke_key(task_id());
+        }));
+        assert!(result.is_err(), "non-owner must not revoke the agent key");
+    }
+
+    #[test]
+    fn revoke_key_by_owner_emits_delete_key_promise() {
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        create(&mut c);
+        // owner (accounts(2), the default context signer) revokes: must not panic
+        // and must create a receipt (delete_key action on the wallet).
+        testing_env!(context().build());
+        let _ = c.revoke_key(task_id());
+        let receipts = near_sdk::test_utils::get_created_receipts();
+        assert!(
+            !receipts.is_empty(),
+            "revoke_key must emit a delete_key action receipt"
+        );
+        // task remains recoverable: still present, not completed
+        let t = c.get_task(task_id()).unwrap();
+        assert!(!t.completed);
+    }
+
+    #[test]
+    fn revoke_key_unknown_task_panics() {
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = c.revoke_key(format!("{}ghost", owner_namespace_prefix(&accounts(2))));
         }));
         assert!(result.is_err());
     }
