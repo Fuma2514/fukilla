@@ -34,13 +34,29 @@ Facts independently re-verified (external auditor, 2026-11-07) against live on-c
 - Tests run with `cargo test -j 1` on the pinned toolchain
 - Deployment verification: `./verify_deployment.sh` — builds the contract at BOTH audit commits (`b2990fb` and HEAD `e9642fb`) in detached git worktrees with the pinned toolchain, hashes each WASM (SHA-256 hex + Base58), queries the on-chain `code_hash` via RPC, reports which commit matches, and **exits non-zero if neither matches**. It prints the full evidence summary (source commit, rustc version, cargo-near version, build command, both hashes, RPC endpoint, raw RPC response). Run it in this repo root to reproduce.
 
-## Release candidate (2026-11-12, commit `d464e6d` on `fix/demo-portability`)
+## Release candidate (2026-11-13, commit `5b4f600` on `fix/demo-portability`)
 
-- Build: `git worktree add --detach /tmp/wt_rc d464e6d && cd /tmp/wt_rc && cargo near build non-reproducible-wasm --locked` (cargo-near 0.22.0, rustc 1.93.0 pinned)
-- WASM: **318,120 B**, SHA-256 **`60db5a34be7b97328607e26871fc43579c59a5a1e3e520e3c2f4ce873627ca6a`**, Base58 **`7X68rFeSMDFgVg4NrbkF9KTcpKKse8jxHPiFHkk5Dohb`**
-- **Determinism verified**: two independent builds in different worktree paths produced the identical hash.
-- Tests at `d464e6d`: unit **25/25**, sandbox **1/1**, SDK signer **5/5** (testnet integration: 1 SKIP by design — no credentials in CI).
-- Not yet deployed. The live `fukilla.testnet` still runs the historical bytecode above until an approved redeploy; after redeploy, `Base58(SHA-256(build))` must equal the new on-chain `code_hash` before this commit may be called "live".
+- Build (Docker `sourcescan/cargo-near:0.22.0-rust-1.97.1`, source mounted at `/tmp/bld`,
+  `cargo near build non-reproducible-wasm --locked`): WASM **286,754 B**, SHA-256
+  **`c1a14a8393979e027441b8fdc94106f20cbc5b20bd12aeb020fdfff128fb4a2f`**,
+  Base58 **`E2rLGtHipTcnpi7tVVz2nRTGKJ8pKhEaAgwJcXrFcXTU`**
+- **Reproducibility verified**: two independent Docker builds from host paths of differing
+  lengths produced byte-identical artifacts (verbatim build logs:
+  `release_archive/e2e_evidence/build_logs/dockerA.log` / `dockerB.log` — each ends with
+  cargo-near's own identical checksum report)
+- Tests at `5b4f600`: unit **35/35**, sandbox **2/2** (incl. a real sandbox-chain F2b
+  revocation test: delete receipt success, agent key dead post-revoke, recovery intact)
+- **Live-verified on NEAR Testnet** (isolated E2E account `fukilla-e2e-11130138.testnet`,
+  deployed code_hash = Base58 of the artifact SHA-256 — exact match): live revocation
+  (`revoke_key` tx `2RjoCAjYE9AbnjpQ2Z1gc4xBrqGYSiPuWFZBVm3FovGU`, key verifiably dead via
+  `view_access_key`, post-revoke signing rejected, task recovered), over-cap panic with
+  funds untouched, velocity self-quarantine, and the full canary-honeypot sequence
+  (`set_canary` → trigger → wallet destroyed → owner recovered 2.2312 NEAR → bait balance
+  0 → 0). Every claim carries a transaction hash or captured RPC error — see
+  [SECURITY.md](SECURITY.md) §2. One disclosed gap: individual velocity-burst tx hashes
+  were not captured; the quarantine state was verified via RPC.
+- The public `fukilla.testnet` account still runs the older bytecode and was NOT touched
+  during this RC's testing.
 
 ## On-chain (testnet, verified via https://rpc.testnet.near.org)
 
@@ -235,6 +251,15 @@ Before deploying to mainnet:
 | No backend needed | ❌ | ❌ | ✅ |
 | Open source | — | — | ✅ |
 
+## Security
+
+Full security posture, threat model, and audit evidence: **[SECURITY.md](SECURITY.md)**.
+Highlights: live-verified revocation/quarantine/canary controls; internal security review
+(Performed by Hermes, not an independent external audit) with finding **F-1 (factory
+full-access key) classified CRITICAL and unmitigated in this RC**; a proposed (not
+implemented) multisig + 48h-timelock upgrade roadmap; no formal verification; no
+production-readiness claim. 5-minute testnet walkthrough: **[QUICKSTART.md](QUICKSTART.md)**.
+
 ## Track eligibility
 
 - Track 06 AI Security & Defense: sandboxed agent wallet, spend limits, function-call keys, self-quarantine
@@ -259,7 +284,10 @@ Integration notes for builders:
 - **Event:** NEAR HACKATHON (2026-11-01 → 2026-11-14, https://nearhackathon.com)
 - **Track:** `security` — AI-controlled money made safer (spend caps, sandboxed per-task wallets, function-call keys)
 - **Status at this repo:** all code below HEAD is written inside the hackathon window; earlier commits (`b2990fb`, `100f29b`) are the pre-hackathon baseline.
-- **Judge quickstart:** clone → `cargo test -j 1` (25 unit tests + 1 near-sandbox integration test) → `./verify_deployment.sh` reproduces the audit evidence against testnet `fukilla.testnet`. Demo tooling in `demo/`; integration guide in `SUBMISSION.md`.
+- **Judge quickstart:** clone → `cargo test -j 1` (35 unit tests + 2 near-sandbox integration
+  tests at HEAD) → `./verify_deployment.sh` reproduces the audit evidence against testnet
+  `fukilla.testnet`. Demo tooling in `demo/`; integration guide in `SUBMISSION.md`;
+  security evidence in `SECURITY.md`; 5-minute walkthrough in `QUICKSTART.md`.
 
 ## License
 
