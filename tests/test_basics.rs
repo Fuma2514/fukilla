@@ -57,7 +57,7 @@ async fn test_ephemeral_on(contract_wasm: Vec<u8>) -> testresult::TestResult<()>
             }),
         )
         .transaction()
-        .deposit(NearToken::from_yoctonear(2_010_000_000_000_000_000_000_000u128)) // 2 NEAR funding + 0.01 NEAR task storage cost
+        .deposit(NearToken::from_yoctonear(2_100_000_000_000_000_000_000_000u128)) // 2 NEAR funding + 0.01 NEAR task storage cost
         .gas(NearGas::from_tgas(100))
         .with_signer(owner.account_id().clone(), signer.clone())
         .send_to(&sandbox_network)
@@ -251,7 +251,7 @@ async fn test_velocity_revoke_on(contract_wasm: Vec<u8>) -> testresult::TestResu
             }),
         )
         .transaction()
-        .deposit(NearToken::from_yoctonear(2_010_000_000_000_000_000_000_000u128))
+        .deposit(NearToken::from_yoctonear(2_100_000_000_000_000_000_000_000u128))
         .gas(NearGas::from_tgas(100))
         .with_signer(owner.account_id().clone(), signer.clone())
         .send_to(&sandbox_network)
@@ -330,12 +330,9 @@ async fn test_velocity_revoke_on(contract_wasm: Vec<u8>) -> testresult::TestResu
         .send_to(&sandbox_network)
         .await?;
 
-    // KNOWN ISSUE F2b (documented by this test): the contract's delete_key
-    // promise is REJECTED by the protocol with ActorNoPermission, because the
-    // factory does not hold a full-access key on the wallet and DeleteKey is
-    // an action that requires one. The revoke log fires, the agent FC key
-    // REMAINS. Honest status: revoke_key is broken on-chain until the
-    // executor contract gains a self-revoke entry point (proposed F2b fix).
+    // F2b FIXED: revoke_key now routes through the wallet's own executor
+    // contract (`revoke_agent_key`), which self-deletes the agent FC key.
+    // The delete receipt must SUCCEED (this was ActorNoPermission before F2b).
     let delete_failed = match &revoke_res {
         near_api::types::transaction::result::TransactionResult::Full(f) => {
             !f.receipt_failures().is_empty()
@@ -343,15 +340,15 @@ async fn test_velocity_revoke_on(contract_wasm: Vec<u8>) -> testresult::TestResu
         _ => true, // no execution data — treat as not-landed
     };
     assert!(
-        delete_failed,
-        "expected the delete_key promise receipt to fail (ActorNoPermission) — if this starts succeeding, F2b was fixed and this assertion must be inverted"
+        !delete_failed,
+        "delete_key receipt must SUCCEED after F2b (self-revoke via executor)"
     );
 
-    // The agent key therefore still works post-revoke (bug evidence).
+    // The revoked agent key can no longer sign ANY transaction for the wallet.
     let post_revoke = pay("after-revoke".to_string()).await;
     assert!(
-        post_revoke.is_ok(),
-        "KNOWN BUG: agent key must still sign (delete_key did not land) — invert this assert when F2b ships"
+        post_revoke.is_err(),
+        "agent key must be dead after F2b revoke_key"
     );
 
     // Owner can still recover: complete the task (sweep is owner-key driven,

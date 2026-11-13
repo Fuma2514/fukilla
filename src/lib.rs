@@ -426,7 +426,20 @@ impl Contract {
             "{{\"event\":\"agent_key_revoked\",\"task_id\":\"{}\",\"wallet\":\"{}\"}}",
             task_id, task.wallet
         ));
-        Promise::new(task.wallet).delete_key(task.agent_key.clone())
+        // F2b: the factory cannot delete_key on the wallet directly
+        // (ActorNoPermission — DeleteKey requires a full-access key on the
+        // target account). Instead, command the wallet's own executor
+        // contract to self-delete the key. The factory→executor call path
+        // is the same authorized route proven live by pay/sweep.
+        Promise::new(task.wallet).function_call(
+            "revoke_agent_key".to_string(),
+            near_sdk::serde_json::to_vec(&near_sdk::serde_json::json!({
+                "public_key": task.agent_key.clone()
+            }))
+            .expect("json serialize"),
+            NearToken::from_yoctonear(0),
+            near_sdk::Gas::from_tgas(20),
+        )
     }
 
     /// Owner closes the task: sweeps the remaining balance back to the owner
