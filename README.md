@@ -34,13 +34,39 @@ Facts independently re-verified (external auditor, 2026-11-07) against live on-c
 - Tests run with `cargo test -j 1` on the pinned toolchain
 - Deployment verification: `./verify_deployment.sh` — builds the contract at BOTH audit commits (`b2990fb` and HEAD `e9642fb`) in detached git worktrees with the pinned toolchain, hashes each WASM (SHA-256 hex + Base58), queries the on-chain `code_hash` via RPC, reports which commit matches, and **exits non-zero if neither matches**. It prints the full evidence summary (source commit, rustc version, cargo-near version, build command, both hashes, RPC endpoint, raw RPC response). Run it in this repo root to reproduce.
 
+## Release candidate (2026-11-13, commit `5b4f600` on `fix/demo-portability`)
+
+- Build (Docker `sourcescan/cargo-near:0.22.0-rust-1.97.1`, source mounted at `/tmp/bld`,
+  `cargo near build non-reproducible-wasm --locked`): WASM **286,754 B**, SHA-256
+  **`c1a14a8393979e027441b8fdc94106f20cbc5b20bd12aeb020fdfff128fb4a2f`**,
+  Base58 **`E2rLGtHipTcnpi7tVVz2nRTGKJ8pKhEaAgwJcXrFcXTU`**
+- **Reproducibility verified**: two independent Docker builds from host paths of differing
+  lengths produced byte-identical artifacts (verbatim build logs:
+  `release_archive/e2e_evidence/build_logs/dockerA.log` / `dockerB.log` — each ends with
+  cargo-near's own identical checksum report)
+- Tests at `5b4f600`: unit **35/35**, sandbox **2/2** (incl. a real sandbox-chain F2b
+  revocation test: delete receipt success, agent key dead post-revoke, recovery intact)
+- **Live-verified on NEAR Testnet** (isolated E2E account `fukilla-e2e-11130138.testnet`,
+  deployed code_hash = Base58 of the artifact SHA-256 — exact match): live revocation
+  (`revoke_key` tx `2RjoCAjYE9AbnjpQ2Z1gc4xBrqGYSiPuWFZBVm3FovGU`, key verifiably dead via
+  `view_access_key`, post-revoke signing rejected, task recovered), over-cap panic with
+  funds untouched, velocity self-quarantine, and the full canary-honeypot sequence
+  (`set_canary` → trigger → wallet destroyed → owner recovered 2.2312 NEAR → bait balance
+  0 → 0). Every claim carries a transaction hash or captured RPC error — see
+  [SECURITY.md](SECURITY.md) §2. One disclosed gap: individual velocity-burst tx hashes
+  were not captured; the quarantine state was verified via RPC.
+- The public `fukilla.testnet` account still runs the older bytecode and was NOT touched
+  during this RC's testing.
+
 ## On-chain (testnet, verified via https://rpc.testnet.near.org)
 
 - Factory account: `fukilla.testnet` (signer & receiver of deploy tx `GEwkF97Q1gdu6jHRu7hZCNpAsXhqAqunwZD69YtSbs2w`, action `DeployContract`, status `SuccessValue` — verified by fetching the tx via RPC)
 - On-chain `code_hash` of `fukilla.testnet` (queried at audit time): `53yp7kAJf3rsGeD54ZKS1VeQ4C7WwR9HZ1Jtw4393eC9` (storage usage 312287 bytes)
+- **Latest deployment transaction: `6QTzdNN9TZERS2VbJAM4bdgobMPcLET1jCaxagq2qX6J`** (confirmed via archival RPC — the most recent `DeployContract` on `fukilla.testnet`). Earlier tx `GEwkF97Q1gdu6jHRu7hZCNpAsXhqAqunwZD69YtSbs2w` is a historical deployment, superseded.
 - Deployment hash verification (2026-11-07, `./verify_deployment.sh`): **MISMATCH — none of the local builds reproduce the on-chain code hash.** All three build routes produce distinct WASMs:
   - plain pinned `cargo build -j 1 --locked --release --target wasm32-unknown-unknown` at `b2990fb` and at `e9642fb` (factory code identical between them): SHA-256 `3b9236b90523da59e1549c2d9a5af89f30acc201c2a7dd7ae7fb2b60cecf5d38` = Base58 `51YNFS3zsoMa6LhaL6s2PWh32LADbSEQ12qHU6nJd3sD` (built in /tmp worktrees; the same commit built in the repo directory yields a DIFFERENT hash `63cc3db49abd634890e10caa2cb56830e43edf94fe8695258267ea1cec0b7bfb` — local plain builds are path-dependent)
   - `cargo near build non-reproducible-wasm --locked` (cargo-near 0.22.0, rustc 1.93.0): SHA-256 `cb555ca2d01b32d764cd2abdce0c9c3d6bc1a459340740c322cafc1b17318d07`
+  - **Re-verified 2026-11-12 (cargo-near 0.22.0, /tmp worktree at `b2990fb`):** SHA-256 `63cc3db49abd634890e10caa2cb56830e43edf94fe8695258267ea1cec0b7bfb`, size **311,168 B** — closest to the deployed WASM (311,400 B, delta = 232 bytes, first divergence at byte 2864, consistent with a shifted data-section offset). One commit earlier, `bf8f060` (cargo-near route): 304,496 B — excluded. `b2990fb`-era source is confirmed as the deploy-time route, but the exact source state remains **not reconstructible from git** (likely an uncommitted working tree at deploy time).
   - `cargo near build reproducible-wasm` with the pinned Docker image (`sourcescan/cargo-near:0.21.1-rust-1.96.0@sha256:ccb22bb4…`): SHA-256 `86291490cab62c8e08a1237e3f55d0d2b59481df5e0504a918e69e46d086aeab` = Base58 `A2hxs4HXmDuJEGHsNnWx5p9dqtVJz6foMnGxKRovWR8W`
   - On-chain: `53yp7kAJf3rsGeD54ZKS1VeQ4C7WwR9HZ1Jtw4393eC9`. **This is an open audit finding: the deployed contract cannot be reproduced byte-for-byte by any route attempted** (possible causes: different commit/toolchain at deploy time, or a non-pinned build; tx `GEwkF97Q1gdu6jHRu7hZCNpAsXhqAqunwZD69YtSbs2w` only carries ~37 bytes of code metadata, so the deployed source cannot be confirmed from the tx alone). Treat deployed-code-to-source attribution as UNVERIFIED.
 - Factory deploy + init txs: `82nihL6tcesZzRYwy8UCyCgWKCiF7mjwTVTobUXFETez` / `8w17hffEXS1GBvSi6dDYckF6VJMvxfyFMmGvKcRVeVmx`
@@ -49,7 +75,7 @@ Facts independently re-verified (external auditor, 2026-11-07) against live on-c
 
 ## Test results (2026-11-07, rustc 1.93.0, `cargo test -j 1` at HEAD `e9642fb`)
 
-- Unit tests (`src/lib.rs`): **21 passed, 0 failed**
+- Unit tests (`src/lib.rs`): **21 passed, 0 failed**; re-run 2026-11-12 at `1283c06`: **25 passed, 0 failed** (includes storage-cost burn, sweep-recovery `on_swept` callback, velocity pairing, and memo-injection hardening tests)
 - Sandbox integration test (`tests/test_basics.rs`, real `near-sandbox` chain + `cargo near` build): **1 passed, 0 failed**
 - SDK signer tests (`sdk/sdk_owner_signer.test.ts`, `node --experimental-strip-types --test`): **5 passed, 0 failed** — proves the SDK signs `create_wallet` AND `complete_task` with the configured `ownerAccountId` (e.g. `alice.owner.testnet`), not the factory account (GPT audit finding A, fixed in `e9642fb`, verified here by test).
 
@@ -103,13 +129,15 @@ Maximum economic exposure per wallet, derived from `src/lib.rs` and `executor/sr
 
 # DOCUMENTED LIMITATIONS (OPEN findings)
 
-**Task ID squatting** (OPEN): Any account can call create_wallet and claim any task_id. There is no allowlist for who may create tasks. In production, use unpredictable task IDs (e.g. UUID or hash-based) to prevent front-running.
+**Task ID squatting** (FIXED in HEAD): `create_wallet` now requires the task_id to start with the first 8 hex chars of SHA-256(owner) — a per-owner namespace enforced on-chain (`expected_task_prefix` view for SDKs/demos). Squatting another owner's ids is infeasible; front-running only works against an *exactly* published id. Residual: use unpredictable suffixes (e.g. UUID) for unannounced tasks.
 
 **Registry growth** (OPEN): Completed tasks remain in storage (marked completed: true). For high-volume deployments, consider periodic cleanup or a separate registry contract.
 
 **Storage griefing** — **STATUS: OPEN (not fixed, not tested)**: Anyone can create tasks. High-volume task creation inflates factory storage. Mitigate with unpredictable task IDs and off-chain rate limiting. This finding remains open until a fix (e.g. owner-signed creation or fee/burn per task id) is implemented AND covered by a passing test.
 
-**Sweep recovery** — **STATUS: OPEN (not fixed, not tested)**: If the sweep promise fails after `force_expire`/`complete_task` (`finalize` marks `completed = true` before the `sweep` promise resolves, with no callback or retry), the task is marked completed but funds may remain in the wallet. No retry path exists currently. This finding remains open until a retry/monitoring path is implemented AND covered by a passing test.
+**Agent-key revocation** (FIXED in HEAD, `revoke_key`): the task owner can immediately delete the agent's function-call key from the wallet (`revoke_key(task_id)`, owner-gated). After revocation the agent cannot sign anything — spending stops at the protocol level, not just at the contract level. The task remains recoverable via `complete_task`/`force_expire` (sweep-back does not depend on the agent key). Covered by unit tests (`revoke_key_wrong_caller_panics`, `revoke_key_by_owner_emits_delete_key_promise`, `revoke_key_unknown_task_panics`).
+
+**Sweep recovery** — STATUS: FIXED (tested): `finalize` sets `sweeping = true` and the `on_swept` callback clears it; a failed sweep does NOT mark the task completed and stays retryable via `force_expire`. Regression test: "a failed sweep must not mark the task completed" (unit, green at HEAD).
 
 **WASM reproducibility** (OPEN): `verify_deployment.sh` compares locally built WASM hashes against the on-chain `code_hash`. If they differ (path/rustc nondeterminism, cargo-near Docker builds vs. plain builds), that is reported as an explicit MISMATCH with both hashes — treat the deployed code as unverified until reproduced byte-for-byte (see `Cargo.toml` `[package.metadata.near.reproducible_build]` for the Docker route).
 
@@ -223,6 +251,15 @@ Before deploying to mainnet:
 | No backend needed | ❌ | ❌ | ✅ |
 | Open source | — | — | ✅ |
 
+## Security
+
+Full security posture, threat model, and audit evidence: **[SECURITY.md](SECURITY.md)**.
+Highlights: live-verified revocation/quarantine/canary controls; internal security review
+(Performed by Hermes, not an independent external audit) with finding **F-1 (factory
+full-access key) classified CRITICAL and unmitigated in this RC**; a proposed (not
+implemented) multisig + 48h-timelock upgrade roadmap; no formal verification; no
+production-readiness claim. 5-minute testnet walkthrough: **[QUICKSTART.md](QUICKSTART.md)**.
+
 ## Track eligibility
 
 - Track 06 AI Security & Defense: sandboxed agent wallet, spend limits, function-call keys, self-quarantine
@@ -247,7 +284,10 @@ Integration notes for builders:
 - **Event:** NEAR HACKATHON (2026-11-01 → 2026-11-14, https://nearhackathon.com)
 - **Track:** `security` — AI-controlled money made safer (spend caps, sandboxed per-task wallets, function-call keys)
 - **Status at this repo:** all code below HEAD is written inside the hackathon window; earlier commits (`b2990fb`, `100f29b`) are the pre-hackathon baseline.
-- **Judge quickstart:** clone → `cargo test -j 1` (25 unit tests + 1 near-sandbox integration test) → `./verify_deployment.sh` reproduces the audit evidence against testnet `fukilla.testnet`. Demo tooling in `demo/`; integration guide in `SUBMISSION.md`.
+- **Judge quickstart:** clone → `cargo test -j 1` (35 unit tests + 2 near-sandbox integration
+  tests at HEAD) → `./verify_deployment.sh` reproduces the audit evidence against testnet
+  `fukilla.testnet`. Demo tooling in `demo/`; integration guide in `SUBMISSION.md`;
+  security evidence in `SECURITY.md`; 5-minute walkthrough in `QUICKSTART.md`.
 
 ## License
 

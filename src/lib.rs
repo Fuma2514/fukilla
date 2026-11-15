@@ -146,6 +146,19 @@ impl Contract {
             max_calls_per_window.is_some() == velocity_window_sec.is_some(),
             "velocity parameters must be provided together or both omitted"
         );
+        // ---- Task-id squatting defense ----
+        // task_id must start with the first 8 hex chars of SHA-256(owner):
+        // every owner gets a private, on-chain-verifiable namespace. Squatting
+        // another owner's ids is economically pointless (you cannot guess their
+        // suffix) and front-running only works against an *exactly* published id.
+        let expected_prefix = owner_namespace_prefix(&env::predecessor_account_id());
+        require!(
+            task_id.starts_with(&expected_prefix),
+            &format!(
+                "task_id must start with the owner namespace prefix {} (call expected_task_prefix view)",
+                expected_prefix
+            )
+        );
         // Validate task_id so the derived sub-account is a valid DIRECT sub-account.
         // A task_id containing dots would parse into a nested account that the
         // factory cannot create -> promise failure -> funding stuck + registry
@@ -397,6 +410,38 @@ impl Contract {
         self.tasks.insert(task_id, task);
     }
 
+    /// Incident response: the task owner immediately deletes the agent's
+    /// function-call key from the wallet. From the next block onward the
+    /// agent cannot sign ANY transaction — spending stops at the protocol
+    /// level, not just at the contract level. The task itself stays alive
+    /// and remains recoverable via complete_task / force_expire (sweep-back
+    /// does not depend on the agent key).
+    pub fn revoke_key(&mut self, task_id: String) -> Promise {
+        let task = self.get_live_task(&task_id);
+        require!(
+            env::predecessor_account_id() == task.owner,
+            "only the task owner can revoke the agent key"
+        );
+        env::log_str(&format!(
+            "{{\"event\":\"agent_key_revoked\",\"task_id\":\"{}\",\"wallet\":\"{}\"}}",
+            task_id, task.wallet
+        ));
+        // F2b: the factory cannot delete_key on the wallet directly
+        // (ActorNoPermission — DeleteKey requires a full-access key on the
+        // target account). Instead, command the wallet's own executor
+        // contract to self-delete the key. The factory→executor call path
+        // is the same authorized route proven live by pay/sweep.
+        Promise::new(task.wallet).function_call(
+            "revoke_agent_key".to_string(),
+            near_sdk::serde_json::to_vec(&near_sdk::serde_json::json!({
+                "public_key": task.agent_key.clone()
+            }))
+            .expect("json serialize"),
+            NearToken::from_yoctonear(0),
+            near_sdk::Gas::from_tgas(20),
+        )
+    }
+
     /// Owner closes the task: sweeps the remaining balance back to the owner
     /// and deletes the wallet account entirely. After this the agent's key
     /// is dead — its account no longer exists.
@@ -511,7 +556,13 @@ mod tests {
     use near_sdk::test_utils::{VMContextBuilder, accounts};
     use near_sdk::{Gas, testing_env};
 
-    const TASK_ID: &str = "research-task-1";
+    fn task_id() -> String {
+        format!("{}research1", owner_namespace_prefix(&accounts(2)))
+    }
+
+    fn stid() -> String {
+        format!("{}sentinel", owner_namespace_prefix(&accounts(2)))
+    }
 
     fn context() -> VMContextBuilder {
         let mut b = VMContextBuilder::new();
@@ -536,7 +587,7 @@ mod tests {
         ctx.attached_deposit(NearToken::from_yoctonear(CREATE_DEPOSIT));
         testing_env!(ctx.build());
         let _ = contract.create_wallet(
-            TASK_ID.to_string(),
+            task_id(),
             pk(),
             3600,
             U128::from(1_000_000_000_000_000_000_000_000u128),
@@ -546,16 +597,202 @@ mod tests {
     }
 
     #[test]
-    fn create_wallet_records_task() {
+    fn wallet_creation_failure_refunds_owner_and_drops_task() {
+        // Simulate the create-wallet promise chain FAILING: the task must be
+        // forgotten and a refund transfer to the owner must be issued.
+        let owner = accounts(2);
+        let funding: u128 = 1_000_000_000_000_000_000_000_000;
+        let mut ctx = context();
+        ctx.attached_deposit(NearToken::from_yoctonear(funding));
+        testing_env!(ctx.build());
+        let mut c = Contract::new(owner.clone());
+        create(&mut c);
+        assert!(c.get_task(task_id()).is_some());
+        // callback runs with a FAILED promise result
+        testing_env!(
+            context().build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![near_sdk::PromiseResult::Failed],
+        );
+        c.on_wallet_created(task_id(), owner.clone(), U128::from(funding));
+        assert!(
+            c.get_task(task_id()).is_none(),
+            "failed creation must forget the task"
+        );
+    }
+
+    #[test]
+    fn dust_agent_payment_succeeds() {
+        // A 1-yoctoNEAR payment is legal (no minimum payment rule): cap
+        // arithmetic must hold at the absolute bottom of the range.
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        sentinel_wallet(&mut c);
+        let wallet = c.get_task(stid()).unwrap().wallet;
+        wallet_ctx(&wallet, 1_000_000_000);
+        let _ = c.agent_call(
+            stid(),
+            "api-provider.near".parse().unwrap(),
+            U128::from(1u128),
+            "dust".to_string(),
+        );
+        let t = c.get_task(stid()).unwrap();
+        assert_eq!(t.spent, 1u128, "dust payment must be recorded exactly");
+        assert!(t.spent <= t.spend_cap);
+    }
+
+    #[test]
+    fn dust_wallet_still_sweeps_and_completes() {
+        // A wallet funded at the 0.01 storage minimum (effectively no spend
+        // headroom) still follows the full lifecycle to completion.
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        let mut cctx = context();
+        cctx.attached_deposit(NearToken::from_yoctonear(CREATE_DEPOSIT));
+        testing_env!(cctx.build());
+        let _ = c.create_wallet(
+            task_id(),
+            pk(),
+            3600,
+            U128::from(1u128), // 1-yocto cap: dust headroom
+            None,
+            None,
+        );
+        testing_env!(context().build());
+        let _ = c.complete_task(task_id());
+        sweep_resolves();
+        c.on_swept(task_id());
+        let t = c.get_task(task_id()).unwrap();
+        assert!(t.completed, "dust wallet must complete its lifecycle");
+        assert!(!t.sweeping);
+    }
+
+    #[test]
+    fn velocity_identical_timestamps_still_burst() {
+        // All attempts share the SAME block timestamp (same block): the
+        // recency filter (now - ts < window) must still count them, so the
+        // burst trips the breaker instead of resetting the window.
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        sentinel_wallet(&mut c);
+        let wallet = c.get_task(stid()).unwrap().wallet;
+        for i in 0..2u64 {
+            wallet_ctx(&wallet, 0); // identical timestamp every time
+            let _ = c.agent_call(
+                stid(),
+                "api-provider.near".parse().unwrap(),
+                U128::from(100_000_000_000_000_000_000_000u128),
+                format!("same-{i}"),
+            );
+        }
+        wallet_ctx(&wallet, 0);
+        let _ = c.agent_call(
+            stid(),
+            "api-provider.near".parse().unwrap(),
+            U128::from(100_000_000_000_000_000_000_000u128),
+            "same-burst".to_string(),
+        );
+        assert!(
+            c.get_task(stid()).unwrap().quarantined,
+            "identical-timestamp burst must trip the breaker"
+        );
+    }
+
+    #[test]
+    fn lift_quarantine_restores_spending() {
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        sentinel_wallet(&mut c);
+        let wallet = c.get_task(stid()).unwrap().wallet;
+        // force a quarantine
+        for i in 0..3u64 {
+            wallet_ctx(&wallet, i);
+            let _ = c.agent_call(
+                stid(),
+                "api-provider.near".parse().unwrap(),
+                U128::from(100_000_000_000_000_000_000_000u128),
+                format!("q-{i}"),
+            );
+        }
+        assert!(c.get_task(stid()).unwrap().quarantined);
+        // owner lifts the quarantine
+        testing_env!(context().build());
+        c.lift_quarantine(stid());
+        let t = c.get_task(stid()).unwrap();
+        assert!(!t.quarantined);
+        assert!(t.call_times.is_empty(), "window must be cleared on lift");
+        // spending works again (fresh window)
+        wallet_ctx(&wallet, 1_000_000_000);
+        let _ = c.agent_call(
+            stid(),
+            "api-provider.near".parse().unwrap(),
+            U128::from(100_000_000_000_000_000_000_000u128),
+            "after-lift".to_string(),
+        );
+        assert!(c.get_task(stid()).unwrap().spent >= 100_000_000_000_000_000_000_000u128);
+    }
+
+    #[test]
+    fn completed_task_rejects_force_expire() {
         let ctx = context();
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
-        let t = c.get_task(TASK_ID.to_string()).unwrap();
+        // owner completes (sweep simulated resolved)
+        testing_env!(context().build());
+        let _ = c.complete_task(task_id());
+        sweep_resolves();
+        c.on_swept(task_id());
+        // racing force_expire on the same task must fail (no double finalize)
+        let mut ctx = context();
+        ctx.signer_account_id(accounts(4));
+        ctx.predecessor_account_id(accounts(4));
+        ctx.block_timestamp(999 * 1_000_000_000);
+        testing_env!(ctx.build());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = c.force_expire(task_id());
+        }));
+        assert!(result.is_err(), "completed task must refuse force_expire");
+    }
+
+    #[test]
+    fn revoked_wallet_still_recoverable_by_owner() {
+        // revoke_key is incident response, not a dead end: after revocation
+        // the owner must still be able to complete the task and sweep funds.
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        create(&mut c);
+        testing_env!(context().build());
+        let _ = c.revoke_key(task_id());
+        // owner still closes the task
+        testing_env!(context().build());
+        let _ = c.complete_task(task_id());
+        sweep_resolves();
+        c.on_swept(task_id());
+        let t = c.get_task(task_id()).unwrap();
+        assert!(t.completed, "task must complete after revoke_key");
+        assert!(!t.sweeping, "sweep flag cleared by on_swept");
+    }
+
+    #[test]
+    fn create_wallet_records_task() {
+
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        create(&mut c);
+        let t = c.get_task(task_id()).unwrap();
         assert!(t.wallet.as_str().contains(".")); // sub-account of the factory account
         assert_eq!(t.spent, 0);
         assert_eq!(t.expiry_ts, 3600 * 1_000_000_000);
-        assert!(c.remaining_spend(TASK_ID.to_string()).0 > 0);
+        assert!(c.remaining_spend(task_id()).0 > 0);
     }
 
     #[test]
@@ -568,7 +805,55 @@ mod tests {
         ctx.attached_deposit(NearToken::from_yoctonear(CREATE_DEPOSIT));
         testing_env!(ctx.build());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = c.create_wallet(TASK_ID.to_string(), pk(), 3600, U128::from(1), None, None);
+            let _ = c.create_wallet(task_id(), pk(), 3600, U128::from(1), None, None);
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn revoke_key_wrong_caller_panics() {
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        create(&mut c);
+        // impersonator (accounts(3)) tries to revoke
+        let mut ctx = context();
+        ctx.signer_account_id(accounts(3));
+        ctx.predecessor_account_id(accounts(3));
+        testing_env!(ctx.build());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = c.revoke_key(task_id());
+        }));
+        assert!(result.is_err(), "non-owner must not revoke the agent key");
+    }
+
+    #[test]
+    fn revoke_key_by_owner_emits_delete_key_promise() {
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        create(&mut c);
+        // owner (accounts(2), the default context signer) revokes: must not panic
+        // and must create a receipt (delete_key action on the wallet).
+        testing_env!(context().build());
+        let _ = c.revoke_key(task_id());
+        let receipts = near_sdk::test_utils::get_created_receipts();
+        assert!(
+            !receipts.is_empty(),
+            "revoke_key must emit a delete_key action receipt"
+        );
+        // task remains recoverable: still present, not completed
+        let t = c.get_task(task_id()).unwrap();
+        assert!(!t.completed);
+    }
+
+    #[test]
+    fn revoke_key_unknown_task_panics() {
+        let ctx = context();
+        testing_env!(ctx.build());
+        let mut c = Contract::new(accounts(2));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = c.revoke_key(format!("{}ghost", owner_namespace_prefix(&accounts(2))));
         }));
         assert!(result.is_err());
     }
@@ -580,7 +865,7 @@ mod tests {
         let mut c = Contract::new(accounts(2));
         create(&mut c);
 
-        let wallet = c.get_task(TASK_ID.to_string()).unwrap().wallet;
+        let wallet = c.get_task(task_id()).unwrap().wallet;
         let mut ctx = context();
         ctx.signer_account_id(wallet.clone());
         ctx.predecessor_account_id(wallet.clone());
@@ -588,13 +873,13 @@ mod tests {
         ctx.prepaid_gas(Gas::from_tgas(100));
         testing_env!(ctx.build());
         let _ = c.agent_call(
-            TASK_ID.to_string(),
+            task_id(),
             "api-provider.near".parse().unwrap(),
             U128::from(400_000_000_000_000_000_000_000u128),
             "text-model-call".to_string(),
         );
         assert_eq!(
-            c.remaining_spend(TASK_ID.to_string()).0,
+            c.remaining_spend(task_id()).0,
             600_000_000_000_000_000_000_000u128
         );
     }
@@ -606,13 +891,13 @@ mod tests {
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
-        let wallet = c.get_task(TASK_ID.to_string()).unwrap().wallet;
+        let wallet = c.get_task(task_id()).unwrap().wallet;
         let mut ctx = context();
         ctx.signer_account_id(wallet.clone());
         ctx.predecessor_account_id(wallet.clone());
         testing_env!(ctx.build());
         let _ = c.agent_call(
-            TASK_ID.to_string(),
+            task_id(),
             "api-provider.near".parse().unwrap(),
             U128::from(2_000_000_000_000_000_000_000_000u128),
             "too-much".to_string(),
@@ -626,14 +911,14 @@ mod tests {
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
-        let wallet = c.get_task(TASK_ID.to_string()).unwrap().wallet;
+        let wallet = c.get_task(task_id()).unwrap().wallet;
         let mut ctx = context();
         ctx.signer_account_id(wallet.clone());
         ctx.predecessor_account_id(wallet.clone());
         ctx.block_timestamp(3600 * 1_000_000_000 + 1);
         testing_env!(ctx.build());
         let _ = c.agent_call(
-            TASK_ID.to_string(),
+            task_id(),
             "api-provider.near".parse().unwrap(),
             U128::from(1),
             "after-expiry".to_string(),
@@ -653,7 +938,7 @@ mod tests {
         ctx.predecessor_account_id(other.clone());
         testing_env!(ctx.build());
         let _ = c.agent_call(
-            TASK_ID.to_string(),
+            task_id(),
             other,
             U128::from(1),
             "steal".to_string(),
@@ -690,19 +975,19 @@ mod tests {
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
-        let owner = c.get_task(TASK_ID.to_string()).unwrap().owner;
+        let owner = c.get_task(task_id()).unwrap().owner;
         let mut ctx = context();
         ctx.signer_account_id(owner.clone());
         ctx.predecessor_account_id(owner);
         testing_env!(ctx.build());
-        let _ = c.complete_task(TASK_ID.to_string());
+        let _ = c.complete_task(task_id());
         // sweeping until the on_swept callback confirms
-        let t = c.get_task(TASK_ID.to_string()).unwrap();
+        let t = c.get_task(task_id()).unwrap();
         assert!(t.sweeping);
         assert!(!t.completed);
         sweep_resolves();
-        c.on_swept(TASK_ID.to_string());
-        assert!(c.get_task(TASK_ID.to_string()).unwrap().completed);
+        c.on_swept(task_id());
+        assert!(c.get_task(task_id()).unwrap().completed);
     }
 
     #[test]
@@ -716,11 +1001,11 @@ mod tests {
         ctx.signer_account_id(accounts(5));
         ctx.predecessor_account_id(accounts(5));
         testing_env!(ctx.build());
-        let _ = c.force_expire(TASK_ID.to_string());
-        assert!(c.get_task(TASK_ID.to_string()).unwrap().sweeping);
+        let _ = c.force_expire(task_id());
+        assert!(c.get_task(task_id()).unwrap().sweeping);
         sweep_resolves();
-        c.on_swept(TASK_ID.to_string());
-        assert!(c.get_task(TASK_ID.to_string()).unwrap().completed);
+        c.on_swept(task_id());
+        assert!(c.get_task(task_id()).unwrap().completed);
     }
 
     #[test]
@@ -730,7 +1015,7 @@ mod tests {
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
-        let _ = c.force_expire(TASK_ID.to_string());
+        let _ = c.force_expire(task_id());
     }
 
     #[test]
@@ -741,7 +1026,7 @@ mod tests {
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         let _ = c.create_wallet(
-            "bad.dotted".to_string(),
+            format!("{}bad.dotted", owner_namespace_prefix(&accounts(2))),
             pk(),
             3600,
             U128::from(2_000_000_000_000_000_000_000_000u128),
@@ -757,7 +1042,7 @@ mod tests {
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
-        let wallet = c.get_task(TASK_ID.to_string()).unwrap().wallet;
+        let wallet = c.get_task(task_id()).unwrap().wallet;
         let mut ctx = context();
         ctx.signer_account_id(wallet.clone());
         ctx.predecessor_account_id(wallet.clone());
@@ -765,7 +1050,7 @@ mod tests {
         ctx.prepaid_gas(Gas::from_tgas(100));
         testing_env!(ctx.build());
         let _ = c.agent_call(
-            TASK_ID.to_string(),
+            task_id(),
             "api-provider.near".parse().unwrap(),
             U128::from(1),
             "with-deposit".to_string(),
@@ -778,7 +1063,7 @@ mod tests {
         ctx.attached_deposit(NearToken::from_yoctonear(CREATE_DEPOSIT));
         testing_env!(ctx.build());
         let _ = c.create_wallet(
-            "sentinel-task".to_string(),
+            stid(),
             pk(),
             3600,
             U128::from(2_000_000_000_000_000_000_000_000u128),
@@ -803,13 +1088,13 @@ mod tests {
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         sentinel_wallet(&mut c);
-        let wallet = c.get_task("sentinel-task".to_string()).unwrap().wallet;
+        let wallet = c.get_task(stid()).unwrap().wallet;
         // 3 rapid calls within the window: 3rd attempt quarantines... actually
         // the 3rd SILENTLY quarantines (no panic), so simulate: two ok calls, third locks
         for i in 0..2u64 {
             wallet_ctx(&wallet, i);
             let _ = c.agent_call(
-                "sentinel-task".to_string(),
+                stid(),
                 "api-provider.near".parse().unwrap(),
                 U128::from(100_000_000_000_000_000_000_000u128),
                 format!("call-{i}"),
@@ -817,16 +1102,16 @@ mod tests {
         }
         wallet_ctx(&wallet, 2);
         let _ = c.agent_call(
-            "sentinel-task".to_string(),
+            stid(),
             "api-provider.near".parse().unwrap(),
             U128::from(100_000_000_000_000_000_000_000u128),
             "burst".to_string(),
         );
-        assert!(c.get_task("sentinel-task".to_string()).unwrap().quarantined);
+        assert!(c.get_task(stid()).unwrap().quarantined);
         // any further call panics on quarantine gate
         wallet_ctx(&wallet, 3);
         let _ = c.agent_call(
-            "sentinel-task".to_string(),
+            stid(),
             "api-provider.near".parse().unwrap(),
             U128::from(1),
             "after-lock".to_string(),
@@ -839,11 +1124,11 @@ mod tests {
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         sentinel_wallet(&mut c);
-        let wallet = c.get_task("sentinel-task".to_string()).unwrap().wallet;
+        let wallet = c.get_task(stid()).unwrap().wallet;
         for i in 0..2u64 {
             wallet_ctx(&wallet, i);
             let _ = c.agent_call(
-                "sentinel-task".to_string(),
+                stid(),
                 "api-provider.near".parse().unwrap(),
                 U128::from(100_000_000_000_000_000_000_000u128),
                 format!("call-{i}"),
@@ -852,12 +1137,12 @@ mod tests {
         // far outside the 60s window -> old calls expire, allowed again
         wallet_ctx(&wallet, 120 * 1_000_000_000);
         let _ = c.agent_call(
-            "sentinel-task".to_string(),
+            stid(),
             "api-provider.near".parse().unwrap(),
             U128::from(100_000_000_000_000_000_000_000u128),
             "later".to_string(),
         );
-        assert!(!c.get_task("sentinel-task".to_string()).unwrap().quarantined);
+        assert!(!c.get_task(stid()).unwrap().quarantined);
     }
 
     #[test]
@@ -867,15 +1152,15 @@ mod tests {
         let mut c = Contract::new(accounts(2));
         sentinel_wallet(&mut c);
         c.set_canary("bait.near".parse().unwrap());
-        let wallet = c.get_task("sentinel-task".to_string()).unwrap().wallet;
+        let wallet = c.get_task(stid()).unwrap().wallet;
         wallet_ctx(&wallet, 0);
         let _ = c.agent_call(
-            "sentinel-task".to_string(),
+            stid(),
             "bait.near".parse().unwrap(),
             U128::from(100_000_000_000_000_000_000_000u128),
             "oops".to_string(),
         );
-        let t = c.get_task("sentinel-task".to_string()).unwrap();
+        let t = c.get_task(stid()).unwrap();
         assert!(t.quarantined);
         assert!(t.sweeping);
     }
@@ -966,7 +1251,7 @@ mod tests {
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         let _ = c.create_wallet(
-            TASK_ID.to_string(),
+            task_id(),
             pk(),
             3600,
             U128::from(2_000_000_000_000_000_000_000_000u128),
@@ -984,7 +1269,7 @@ mod tests {
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         let _ = c.create_wallet(
-            TASK_ID.to_string(),
+            task_id(),
             pk(),
             3600,
             U128::from(2_000_000_000_000_000_000_000_000u128),
@@ -992,7 +1277,7 @@ mod tests {
             None,
         );
         // the wallet receives funding minus the 0.01 NEAR storage burn
-        let t = c.get_task(TASK_ID.to_string()).unwrap();
+        let t = c.get_task(task_id()).unwrap();
         assert_eq!(t.funding, CREATE_DEPOSIT);
         assert!(!t.completed);
     }
@@ -1010,19 +1295,19 @@ mod tests {
         let mut c = Contract::new(accounts(2));
         create(&mut c);
         // owner completes: sweep initiated, not yet completed
-        let owner = c.get_task(TASK_ID.to_string()).unwrap().owner;
+        let owner = c.get_task(task_id()).unwrap().owner;
         let mut ctx = context();
         ctx.signer_account_id(owner.clone());
         ctx.predecessor_account_id(owner.clone());
         testing_env!(ctx.build());
-        let _ = c.complete_task(TASK_ID.to_string());
-        let t = c.get_task(TASK_ID.to_string()).unwrap();
+        let _ = c.complete_task(task_id());
+        let t = c.get_task(task_id()).unwrap();
         assert!(t.sweeping && !t.completed);
 
         // sweep promise FAILS -> sweeping cleared, task retryable
         sweep_fails();
-        c.on_swept(TASK_ID.to_string());
-        let t = c.get_task(TASK_ID.to_string()).unwrap();
+        c.on_swept(task_id());
+        let t = c.get_task(task_id()).unwrap();
         assert!(!t.sweeping);
         assert!(!t.completed, "a failed sweep must not mark the task completed");
 
@@ -1032,13 +1317,13 @@ mod tests {
         ctx.predecessor_account_id(owner);
         ctx.block_timestamp(3600 * 1_000_000_000 + 1);
         testing_env!(ctx.build());
-        let _ = c.force_expire(TASK_ID.to_string());
-        assert!(c.get_task(TASK_ID.to_string()).unwrap().sweeping);
+        let _ = c.force_expire(task_id());
+        assert!(c.get_task(task_id()).unwrap().sweeping);
 
         // this time the sweep resolves -> completed
         sweep_resolves();
-        c.on_swept(TASK_ID.to_string());
-        assert!(c.get_task(TASK_ID.to_string()).unwrap().completed);
+        c.on_swept(task_id());
+        assert!(c.get_task(task_id()).unwrap().completed);
     }
 
     /// While a sweep is in flight a second finalize must be rejected (no
@@ -1049,25 +1334,25 @@ mod tests {
         testing_env!(ctx.build());
         let mut c = Contract::new(accounts(2));
         create(&mut c);
-        let owner = c.get_task(TASK_ID.to_string()).unwrap().owner;
+        let owner = c.get_task(task_id()).unwrap().owner;
         let mut ctx = context();
         ctx.signer_account_id(owner.clone());
         ctx.predecessor_account_id(owner.clone());
         testing_env!(ctx.build());
-        let _ = c.complete_task(TASK_ID.to_string());
+        let _ = c.complete_task(task_id());
 
         // second finalize while sweeping panics
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = c.complete_task(TASK_ID.to_string());
+            let _ = c.complete_task(task_id());
         }));
         assert!(result.is_err(), "double finalize while sweeping must panic");
 
         // the agent key cannot spend while the sweep is in flight
-        let wallet = c.get_task(TASK_ID.to_string()).unwrap().wallet;
+        let wallet = c.get_task(task_id()).unwrap().wallet;
         wallet_ctx(&wallet, 0);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = c.agent_call(
-                TASK_ID.to_string(),
+                task_id(),
                 "api-provider.near".parse().unwrap(),
                 U128::from(1),
                 "during-sweep".to_string(),
@@ -1172,7 +1457,7 @@ mod fuzz {
         testing_env!(c.build());
         let mut contract = Contract::new(accounts(2));
         let _ = contract.create_wallet(
-            "fuzz-amt".to_string(),
+            format!("{}fuzz-amt", owner_namespace_prefix(&accounts(2))),
             "ed25519:8h7kFK4t1Pj5wMsmvB5NmMBiF9YZTfbvJdeWPDXCCbT8"
                 .parse()
                 .unwrap(),
@@ -1181,7 +1466,7 @@ mod fuzz {
             Some(10),
             Some(60),
         );
-        let wallet = contract.get_task("fuzz-amt".to_string()).unwrap().wallet;
+        let wallet = contract.get_task(format!("{}fuzz-amt", owner_namespace_prefix(&accounts(2)))).unwrap().wallet;
         let amounts = [
             0u128,
             1,
@@ -1202,14 +1487,14 @@ mod fuzz {
             testing_env!(c.build());
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = contract.agent_call(
-                    "fuzz-amt".to_string(),
+                    format!("{}fuzz-amt", owner_namespace_prefix(&accounts(2))),
                     "api.near".parse().unwrap(),
                     U128::from(amt),
                     "fuzz".to_string(),
                 );
             }));
             // spent must never exceed cap
-            let t = contract.get_task("fuzz-amt".to_string()).unwrap();
+            let t = contract.get_task(format!("{}fuzz-amt", owner_namespace_prefix(&accounts(2)))).unwrap();
             assert!(t.spent <= t.spend_cap, "CAP VIOLATED at {}", amt);
         }
     }
@@ -1220,7 +1505,7 @@ mod fuzz {
         testing_env!(ctx(50_000_000_000_000_000_000_000).build());
         let mut c = Contract::new(accounts(2));
         let _ = c.create_wallet(
-            "tiny".to_string(),
+            format!("{}tiny", owner_namespace_prefix(&accounts(2))),
             "ed25519:8h7kFK4t1Pj5wMsmvB5NmMBiF9YZTfbvJdeWPDXCCbT8"
                 .parse()
                 .unwrap(),
@@ -1229,5 +1514,20 @@ mod fuzz {
             None,
             None,
         );
+    }
+}
+
+/// Deterministic owner namespace: first 8 hex chars of SHA-256(owner account).
+/// Task ids must start with this prefix (squatting defense).
+fn owner_namespace_prefix(owner: &AccountId) -> String {
+    env::sha256(owner.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect::<String>()[..8].to_string()
+}
+
+#[near]
+impl Contract {
+    /// View: the task_id prefix the caller's owner must use. SDKs and demos
+    /// call this to construct valid task ids.
+    pub fn expected_task_prefix(&self, owner: AccountId) -> String {
+        owner_namespace_prefix(&owner)
     }
 }

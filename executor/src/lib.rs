@@ -53,4 +53,27 @@ impl Executor {
         // factory's spend_cap already bounds the total outflow.
         near_sdk::Promise::new(receiver).transfer(NearToken::from_yoctonear(amount));
     }
+
+    /// F2b incident response: delete the agent's function-call key from THIS
+    /// wallet. Self-action (actor == this account) is permitted by the NEAR
+    /// protocol; the factory — the wallet's parent — is the only authorized
+    /// caller, exactly like pay/sweep. Deleting a key cannot move funds:
+    /// this is a pure lock-out.
+    pub fn revoke_agent_key(&self, public_key: String) {
+        require!(
+            env::predecessor_account_id()
+                == env::current_account_id()
+                    .as_str()
+                    .split_once('.')
+                    .map(|(_, parent)| parent.to_string())
+                    .unwrap_or_default(),
+            "only the factory can revoke keys on this wallet"
+        );
+        env::log_str(&format!(
+            "{{\"event\":\"agent_key_deleted\",\"key\":\"{}\"}}",
+            public_key
+        ));
+        near_sdk::Promise::new(env::current_account_id())
+            .delete_key(public_key.parse().expect("valid ed25519 public key"));
+    }
 }
