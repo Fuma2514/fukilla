@@ -7,6 +7,13 @@ Prereqs: Node.js 18+, [near CLI](https://github.com/near/near-cli-rs) (`cargo in
 a NEAR **Testnet** account with ≥ 6 NEAR (faucet: https://near-faucet.io).
 This walkthrough uses TESTNET only.
 
+> Verified deployment: the current master source reproduces the RC artifact
+> byte-for-byte (SHA-256 `c1a14a83…fb4a2f`) and is deployed and verified at
+> **`fukilla-v2.testnet`** (deploy tx
+> `39UB6fXj4HS1FUxSuTp2anZSXsDTWjjwsXFrihYccKJS`, on-chain `code_hash`
+> `E2rLGtHipTcnpi7tVVz2nRTGKJ8pKhEaAgwJcXrFcXTU`). The original
+> `fukilla.testnet` account runs older bytecode and is unchanged.
+
 ## 1. Build & deploy the factory
 
 ```bash
@@ -25,7 +32,9 @@ cd ..
 ```
 
 The agent key is an FC key scoped to **`agent_call` on the factory only**, with
-allowance = spend_cap + 0.5 NEAR — the agent cannot hold anything more.
+allowance = spend_cap + GAS_ALLOWANCE_MARGIN — the agent cannot hold anything more.
+(Correction, finding F-A 2026-11-15: the margin is 500 NEAR, not 0.5 NEAR as
+originally documented — see SECURITY.md §3.)
 
 ## 3. Create a task wallet (owner)
 
@@ -55,7 +64,8 @@ with the agent FC key installed.
 near call <your-account>.testnet agent_call '{
   "task_id": "my-first-task",
   "receiver_id": "<receiver>.testnet",
-  "amount": "1000000000000000000000"        // 0.001 NEAR
+  "amount": "1000000000000000000000",       // 0.001 NEAR
+  "memo": "payment for <task>"
 }' --signerKey ed25519:<agent-secret-key>
 ```
 

@@ -58,6 +58,31 @@ Facts independently re-verified (external auditor, 2026-11-07) against live on-c
 - The public `fukilla.testnet` account still runs the older bytecode and was NOT touched
   during this RC's testing.
 
+## Verified redeployment (2026-11-15, master `b2549ce`)
+
+- The current master source builds **byte-identically** to the RC artifact:
+  `cargo near build non-reproducible-wasm --locked` (rustc 1.97.1,
+  cargo-near 0.22.0) → WASM **286,754 B**, SHA-256
+  **`c1a14a8393979e027441b8fdc94106f20cbc5b20bd12aeb020fdfff128fb4a2f`**,
+  Base58 **`E2rLGtHipTcnpi7tVVz2nRTGKJ8pKhEaAgwJcXrFcXTU`** — the same hash
+  as the RC artifact and the E2E deployment. (Build-path note: the WASM
+  embeds dependency file paths, so reproduction requires
+  `CARGO_HOME=/home/near/.cargo`, matching the Docker image; a different
+  `CARGO_HOME` shifts the hash, e.g. `2ea970a8…` for a workspace cargo home.)
+- Fresh deployment on NEAR Testnet: **`fukilla-v2.testnet`** — deploy tx
+  `39UB6fXj4HS1FUxSuTp2anZSXsDTWjjwsXFrihYccKJS`; on-chain `code_hash`
+  `E2rLGtHipTcnpi7tVVz2nRTGKJ8pKhEaAgwJcXrFcXTU` (**exact match**), confirmed
+  at the bytecode level (downloaded deployed code hashes to `c1a14a83…`).
+- End-to-end on the new deployment: init tx
+  `53z8KkFtZgFvUGWFTKjvmmgUskX9iFeXez1G9vpHHyrQ`; `create_wallet` tx
+  `5Y6AVQf1QyZSRZh9B316EZyKFDu2prpZNaXsYwyDUk5s` → wallet
+  `8f6f3ef4verify-01.fukilla-v2.testnet` (2.1 NEAR, 1 FunctionCall key);
+  agent payment tx `DbdjJekM4ac9GactAU7K66qjm32LAMS5ZZfGXSQmLVVu`
+  (0.001 NEAR, `spent` recorded on-chain).
+- The original `fukilla.testnet` account still runs the older bytecode
+  (`code_hash` `53yp7kAJf3rsGeD54ZKS1VeQ4C7WwR9HZ1Jtw4393eC9`, 311,400 B)
+  and was not touched; it remains the deployment shown in the demo video.
+
 ## On-chain (testnet, verified via https://rpc.testnet.near.org)
 
 - Factory account: `fukilla.testnet` (signer & receiver of deploy tx `GEwkF97Q1gdu6jHRu7hZCNpAsXhqAqunwZD69YtSbs2w`, action `DeployContract`, status `SuccessValue` — verified by fetching the tx via RPC)
@@ -86,7 +111,7 @@ Facts independently re-verified (external auditor, 2026-11-07) against live on-c
 Statements the code implements but that are NOT independently verified against live chain state; taken on the code's face. Verify with `verify_deployment.sh` and your own tx inspection before trusting them.
 
 1. **Least privilege** — the FC key can call exactly one method (`agent_call` on the factory) — enforced by `Allowance::limited(..., env::current_account_id(), "agent_call")` in `create_wallet` (`src/lib.rs`).
-2. **On-chain spend cap** — `spent <= spend_cap` enforced in `agent_call` (`require!(new_spent <= t.spend_cap)`); the protocol allowance adds a fixed 0.5 NEAR gas margin (`GAS_ALLOWANCE_MARGIN`) and is NOT the real cap.
+2. **On-chain spend cap** — `spent <= spend_cap` enforced in `agent_call` (`require!(new_spent <= t.spend_cap)`); the protocol allowance adds a fixed gas margin (`GAS_ALLOWANCE_MARGIN`) and is NOT the real cap. **Correction (2026-11-15, finding F-A):** the margin is **500 NEAR**, not 0.5 NEAR as originally documented — see [SECURITY.md](SECURITY.md) §3.
 3. **No ownership** — the agent key cannot transfer the account, deploy contracts, or change keys (properties of FC keys + `signer == task.wallet` gate).
 4. **Self-destruct** — `complete_task` / `force_expire` → `finalize` → executor `sweep` → `delete_account(beneficiary)` (`src/lib.rs::finalize`, `executor/src/lib.rs::sweep`).
 5. **Isolation of funds** — `agent_call` forwards to the executor's `pay`, which transfers from the sub-account's own balance (`executor/src/lib.rs::pay`).
@@ -113,16 +138,16 @@ Maximum economic exposure per wallet, derived from `src/lib.rs` and `executor/sr
 |---|---|---|
 | Storage staking (executor WASM + account + key) | Measured **0.845 NEAR** on testnet; code requires funding **≥ 2 NEAR** (`src/lib.rs::create_wallet`, `require!(funding >= 2e24)`) | executor WASM embedded via `include_bytes!("../executor.wasm")`; deployed with `Promise::new(wallet).create_account().transfer(funding).deploy_contract(...)` |
 | Agent outflow (payments) | Hard-capped at `spend_cap` (cumulative): `require!(new_spent <= t.spend_cap)` in `agent_call`; enforced **before** the `pay` promise | `src/lib.rs::agent_call` |
-| Agent gas via protocol allowance | FC key allowance = `spend_cap + GAS_ALLOWANCE_MARGIN (0.5 NEAR)` — burnt gas is deducted from this allowance, so up to **0.5 NEAR** of gas can be consumed by the agent key *without* a successful payment and WITHOUT incrementing `spent` (finding D: gas budget is separate from the payment cap) | `create_wallet`: `Allowance::limited(cap + GAS_ALLOWANCE_MARGIN)`; comment notes worst realistic case ~300 Tgas × 1e10 = 3 NEAR at peak gas price, in which case the allowance itself would block the tx (bounded loss = allowance size) |
+| Agent gas via protocol allowance | FC key allowance = `spend_cap + GAS_ALLOWANCE_MARGIN` — burnt gas is deducted from this allowance, so gas can be consumed by the agent key *without* a successful payment and WITHOUT incrementing `spent` (finding D: gas budget is separate from the payment cap). **Correction (F-A, 2026-11-15): the margin is 500 NEAR, not 0.5 NEAR** — the gas-burn bound is min(500 NEAR, wallet balance), not 0.5 NEAR; see [SECURITY.md](SECURITY.md) §3 | `create_wallet`: `Allowance::limited(cap + GAS_ALLOWANCE_MARGIN)`; worst realistic case ~300 Tgas × 1e10 = 3 NEAR at peak gas price is covered by the 500 NEAR margin (bounded loss = allowance size) |
 | `agent_call` execution gas | Charged to the caller (the wallet sub-account via the FC key) — 5 Tgas cross-contract `pay` call | `agent_call`: `Gas::from_tgas(5)` |
 | Sweep/teardown gas | 20 Tgas `sweep` call + `delete_account` | `finalize`: `Gas::from_tgas(20)` |
 | `create_wallet` gas | ~500 Tgas prepaid, paid by the creating owner, not the wallet | README integration notes + promise chain size |
 
-**Maximum economic exposure per wallet** = `funding (≥ 2 NEAR, owner-supplied) + up to 0.5 NEAR gas burnt against the FC-key allowance` ≈ **2.5 NEAR**, plus whatever exceeds the minimum funding the owner attaches. Of the funding, up to `spend_cap` can reach third parties via `agent_call`; the remainder (funding − spend_cap − agent gas burnt) is recoverable by the sweep (`sweep` / `delete_account`), except in the sweep-failure scenario below. The factory account itself is exposed only to its own gas and the storage-griefing finding (registry entries are paid by creators' deposits, but completed entries are never cleaned).
+**Maximum economic exposure per wallet** = `funding (≥ 2 NEAR, owner-supplied) + gas burnt against the FC-key allowance`. **Correction (F-A, 2026-11-15): the allowance margin is 500 NEAR, not 0.5 NEAR**, so the gas-burn bound is min(500 NEAR, wallet balance) — for a typically funded wallet the agent could burn most of its liquid balance in gas, not just 0.5 NEAR; the previously stated ≈ **2.5 NEAR** total assumed the 0.5 NEAR figure and is superseded — see [SECURITY.md](SECURITY.md) §3. Of the funding, up to `spend_cap` can reach third parties via `agent_call`; the remainder (funding − spend_cap − agent gas burnt) is recoverable by the sweep (`sweep` / `delete_account`), except in the sweep-failure scenario below. The factory account itself is exposed only to its own gas and the storage-griefing finding (registry entries are paid by creators' deposits, but completed entries are never cleaned).
 
 **What cannot be derived from code** (missing for exact numbers):
 - No constant for the executor WASM byte size is asserted in code — the 0.845 NEAR storage figure is a one-time measurement, not checked at build time.
-- Gas prices are dynamic (`1e9–1e10 yoctoNEAR/gas` per code comments); exact worst-case gas NEAR value cannot be fixed at compile time. The code acknowledges this: a 3 NEAR allowance would be needed for 300 Tgas at peak price, but only `cap + 0.5 NEAR` is granted — under peak prices the agent tx would fail (funds safe, task may stall).
+- Gas prices are dynamic (`1e9–1e10 yoctoNEAR/gas` per code comments); exact worst-case gas NEAR value cannot be fixed at compile time. **Correction (F-A, 2026-11-15):** the granted allowance is `cap + 500 NEAR`, not `cap + 0.5 NEAR` — a 300 Tgas peak-price call (~3 NEAR) is covered by the margin, so the agent tx would NOT fail at peak prices; the earlier "funds safe, task may stall" conclusion is superseded — see [SECURITY.md](SECURITY.md) §3.
 - Sweep-failure refund accounting: `finalize` marks `completed = true` *before* the sweep promise resolves and has no callback/retry; the exact recoverable balance on sweep failure depends on runtime state not modeled in code (see DOCUMENTED LIMITATIONS).
 
 ---
@@ -143,14 +168,17 @@ Maximum economic exposure per wallet, derived from `src/lib.rs` and `executor/sr
 
 **Gas budget is separate from the payment cap** (finding D, kept as a limitation):
 The agent's function-call key allowance is
-`spend_cap + 0.5 NEAR (GAS_ALLOWANCE_MARGIN)`. Transaction
+`spend_cap + GAS_ALLOWANCE_MARGIN`. Transaction
 gas consumed by the agent is paid from that allowance and
 does NOT increment `spent`. A compromised agent could burn
 gas (e.g. repeated zero-value payments) without ever
 touching the payment cap — total economic loss is bounded
-by `spend_cap + gas budget`, not `spend_cap` alone. If you
-need to cap the entire budget, lower the key allowance or
-treat the margin as an additional risk budget.
+by `spend_cap + gas budget`, not `spend_cap` alone.
+**Correction (F-A, 2026-11-15): the margin is 500 NEAR, not 0.5 NEAR**
+as originally stated here — the gas budget is min(500 NEAR, wallet
+balance). If you need to cap the entire budget, lower the key
+allowance or treat the margin as an additional risk budget.
+See [SECURITY.md](SECURITY.md) §3.
 
 ---
 

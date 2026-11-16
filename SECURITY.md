@@ -23,7 +23,7 @@ a **factory** (`src/lib.rs`) creates ephemeral **wallet sub-accounts** running a
 
 | Layer | Mechanism | Enforcement point (verified at 5b4f600) |
 |---|---|---|
-| Protocol confinement | The agent key is a FunctionCall key restricted to method `agent_call` on the factory, with allowance = spend_cap + 0.5 NEAR | NEAR access-key permission model (`create_wallet` L103, `add_access_key_allowance` L218–224) |
+| Protocol confinement | The agent key is a FunctionCall key restricted to method `agent_call` on the factory, with allowance = spend_cap + GAS_ALLOWANCE_MARGIN | NEAR access-key permission model (`create_wallet` L103, `add_access_key_allowance` L218–224). **Correction (F-A): the margin is 500 NEAR, not 0.5 NEAR as originally stated** |
 | Direct-signer requirement | `agent_call` requires `signer == predecessor` (no cross-contract relay) | src/lib.rs L288 |
 | No stray deposits | `agent_call` panics on any attached deposit | src/lib.rs L294 |
 | Ownership binding | signer must equal the task wallet | src/lib.rs L300 |
@@ -111,9 +111,21 @@ third-party verified. Full report: `SECURITY_REVIEW_CONSOLIDATED.md`.
 - F-2 (LOW, by design): the call that fills the velocity window still executes before the
   breaker trips; total outflow remains bounded by the spend cap.
 - F-3 (LOW, theoretical): agent key allowance includes 0.5 NEAR gas headroom — bounded
-  gas-griefing surface, no fund-theft path.
+  gas-griefing surface, no fund-theft path. **Superseded by F-A (2026-11-15): the margin
+  is actually 500 NEAR, not 0.5 NEAR.**
 - F-4 (LOW, theoretical): `agent_call` panics on unknown task ids; caller loses only their
   own gas; no state effect.
+- **F-A (OPEN, found 2026-11-15 during the verified redeployment).**
+  `GAS_ALLOWANCE_MARGIN` (`src/lib.rs:73`) is 500 NEAR, not 0.5 NEAR — the literal
+  `500_000_000_000_000_000_000_000_000` yocto equals 500 NEAR despite the "0.5 NEAR"
+  comment and docs. Proven on-chain: the E2E wallet's FC key allowance is 500.05 NEAR
+  at creation (0.05 NEAR spend cap + 500 NEAR margin). Effect: the agent key's gas-burn
+  griefing bound is min(500 NEAR, wallet balance), not 0.5 NEAR — for a typically
+  funded wallet the agent could burn most of its liquid balance in gas. Not a
+  fund-theft issue (`spend_cap` is still enforced on-chain). Fixing the constant
+  changes the WASM hash and requires a rebuild + redeploy; no fix is applied in this
+  RC. This finding supersedes the 0.5 NEAR figures in F-3 above, §1, §6 item 4,
+  README, and QUICKSTART.
 
 Verified non-issues (guards present, cited in the consolidated report): canary bypass via
 direct executor calls; reentrancy/double-spend on sweep; callback spoofing (`#[private]`
@@ -162,7 +174,8 @@ implemented and verified.
 2. No independent external audit; no formal verification; property-based fuzzing limited to
    the existing fuzz module.
 3. Velocity breaker bounds *future* calls; within-cap call frequency is by design.
-4. Agent-key allowance permits up to 0.5 NEAR of gas burn (bounded griefing).
+4. Agent-key allowance permits gas burn up to min(500 NEAR, wallet balance) — see F-A
+   (previously documented as 0.5 NEAR).
 5. Storage stake on wallets is sized for the embedded executor; wallet creation can fail on
    chain if funding is marginal (refund path exists and is tested; live incident documented
    and fixed by raising minimum funding).
